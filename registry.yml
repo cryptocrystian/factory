@@ -1,0 +1,11 @@
+# Portfolio registry — which repos the factory operates on, and their lane opt-ins.
+# A repo is only touched by lanes it explicitly opts into.
+
+repos:
+  arxus:
+    path: ~/projects/arxus
+    remote: https://github.com/cryptocrystian/arxus
+    stack: next-supabase
+    canon: canon/            # canon lives at repo root
+    status: p0               # first by-hand run; no lanes automated yet
+    lanes: []                # opt-ins added as lanes come online

@@ -1,0 +1,19 @@
+# Run records — the raw trace/audit, not source. Regenerable, can be large.
+runs/
+*.db
+*.db-wal
+*.db-shm
+
+# Secrets — never committed. Injected per phase.
+.env
+.env.*
+
+# Python / uv
+__pycache__/
+*.pyc
+.venv/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
