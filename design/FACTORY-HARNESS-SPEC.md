@@ -47,12 +47,18 @@ One phase = one bounded OMP invocation. In: a system prompt (role identity, froz
 
 ## 3. OMP invocation spec (per phase)
 
+> **⚠ Verified (smoke test 2026-08-07):** in `-p` mode with a non-TTY stdin (any subprocess), OMP
+> **reads the prompt from stdin and ignores the positional argument**, blocking on EOF until stdin
+> closes. The adapter MUST feed the prompt via stdin (`printf '%s' "$prompt" | omp -p …`), not as a
+> positional. Also pass `--no-title` (title auto-generation spawns an extra model call per phase).
+
 Baseline flags for **every** factory phase (non-interactive executor):
 
 | Flag | Value | Why |
 |---|---|---|
-| `-p` / `--print` | on | Non-interactive: process one turn and exit. |
-| `--mode json` | on | Structured output for envelope parsing. (Confirm exact event schema in smoke test.) |
+| `-p` / `--print` | on | Non-interactive: process one turn and exit. **Prompt piped via stdin.** |
+| `--mode json` | on | JSONL event stream (verified schema in §3a). |
+| `--no-title` | on | Suppress the extra title-generation model call. |
 | `--model` | per role (§5) | Role's assigned model. |
 | `--thinking` | per role | e.g. `xhigh` planner/builder, `high` reviewer, `low` documenter/classifier. |
 | `--tools` | per role allowlist | Capability list — the narrow set the role needs. |
@@ -73,6 +79,20 @@ Baseline flags for **every** factory phase (non-interactive executor):
 
 **Compaction:** irrelevant if phases stay bounded (the factory has no long context by design). Leave
 default; a phase that would trigger it is too big and should be decomposed.
+
+### 3a. `--mode json` event stream (verified)
+
+JSONL, one event per line. Observed sequence: `session` → `agent_start` → (`turn_start` →
+`message_start`/`message_update`/`message_end` → `tool_execution_start`/`_update`/`_end` → `turn_end`)×N
+→ `agent_end`. What the adapter reads:
+
+| Need | Where |
+|---|---|
+| **Session id** (for the correction loop) | first `session` event, `.id`. Matches the session filename under `--session-dir`. |
+| **The envelope** | `agent_end.messages[-1]` (the last `assistant` message) — content is the model's final text. In the test it was **bare JSON**, no fence: `{"status":"success","summary":"…"}`. |
+| **Terminal?** | `agent_end.isTerminal`. |
+| **Tool-call spans** (for the tracer) | `tool_execution_*` — `toolCallId`, `toolName`, `args`, `intent`, `result`, `isError`. |
+| **Usage & cost** (for the Budget port) | `.message.usage` on `message_end`/`turn_end`/`agent_end.messages[*]`: `{input, output, cacheRead, cacheWrite, totalTokens, cost:{…dollars per component…}, cttl}`. **`cacheRead` > 0 on later turns confirms prompt caching is live** — the §7 cost lever, directly measurable. |
 
 ---
 
@@ -98,24 +118,29 @@ enforcer rolls it back, not because OMP refused it.
 
 ## 5. modelRoles mapping (Arxus P0)
 
-Honors the family constraints from Rev4 §12. Exact non-Anthropic IDs to be confirmed with
-`omp models`; families are the hard requirement, specific IDs are tunable.
+Honors the family constraints from Rev4 §12. **Model IDs verified present via `omp models`
+(2026-08-07).** Both judgment families are authenticated **on subscription** — Anthropic (Claude) and
+OpenAI (Codex Plus) — so the cross-family calls cost subscription capacity, not metered list price.
 
 | Role | Model | Family | Thinking | Pool |
 |---|---|---|---|---|
 | Classifier / triage | `claude-haiku-4-5` | Anthropic | low | subscription |
 | Planner | `claude-opus-5` | Anthropic | high–xhigh | subscription |
-| Criteria reviewer | OpenAI frontier (e.g. `gpt-5.x`) | **≠ planner** | high | metered |
+| Criteria reviewer | `gpt-5.6-terra` | OpenAI · **≠ planner** | high | subscription (Codex) |
 | Builder | `claude-opus-5` | Anthropic | xhigh → sweep down | subscription |
-| Test author | OpenAI or Gemini frontier | **≠ builder** | high | metered |
-| Reviewer | OpenAI or Gemini frontier | **≠ builder** (mandatory) | high | metered |
-| Walker (L3) | Gemini/GPT vision workhorse | optional | medium | metered |
-| Consensus panel (L4) | ≥2 of {Anthropic, OpenAI, Gemini} | **≥2 families** | medium | metered |
+| Test author | `gpt-5.6-sol` | OpenAI · **≠ builder** | high | subscription (Codex) |
+| Reviewer | `gpt-5.6-terra` | OpenAI · **≠ builder** (mandatory) | high | subscription (Codex) |
+| Walker (L3) | `gpt-5.6-*` (vision) or Gemini | vision workhorse | medium | subscription/metered |
+| Consensus panel (L4) | `claude-opus-5` + `gpt-5.6-sol` (+ Gemini when authed) | **≥2 families** | medium | subscription |
 | Documenter | `claude-sonnet-5` | Anthropic | low | subscription |
 
-Config: set via `omp config set modelRoles ...` with `modelRoleStorage = project` so the mapping lives
-with the factory, not the user profile. Token-heavy roles (plan/build/test-as-Anthropic) draw the
-subscription; the short cross-family judgment calls are the small, well-placed metered spend (§12).
+Available frontier IDs seen: Anthropic `claude-opus-5`, `claude-sonnet-5`, `claude-haiku-4-5`,
+`claude-fable-5`; OpenAI (Codex) `gpt-5.6-terra`/`-sol`/`-luna`, `gpt-5.5`, `gpt-5.4`. Gemini is not
+yet authenticated — add `GEMINI_API_KEY` to widen the L4 panel to a third family.
+
+Config: set via `omp config set modelRoles …` with `modelRoleStorage = project` so the mapping lives
+with the factory, not the user profile. With both families on subscription, the metered spill is
+near-zero at P0 volume — better than the §12 baseline assumption.
 
 ---
 
@@ -125,10 +150,14 @@ A failed gate returns to the **same** OMP session as a correction, never a cold 
 context that produced the near-miss — `sssf` bounds this by `retries`).
 
 Mechanism: the first call for a phase writes its session under `--session-dir runs/<id>/omp/<agent>`;
-the adapter captures the session id from the json stream; a correction re-invokes with
-`-r <session-id>` (resume) + the gate's verbatim findings as the new user message. Bound by the phase's
-retry count. **To confirm in the smoke test:** that `--mode json` emits the session id and that
-`-r <id>` reliably continues rather than forks.
+the adapter captures the session id from the first `session` event; a correction re-invokes with
+`-r <session-id>` (resume) + the gate's verbatim findings as the new (stdin) user message. Bound by
+the phase's retry count.
+
+**Verified (smoke test 2026-08-07):** `-r <id-prefix>` **appends to the same session file** (session
+count 1→1, no fork), the resumed run reports the **same session id**, and **context is intact** — the
+resumed turn correctly answered a question about the prior turn's action. The correction loop is
+buildable exactly as specced.
 
 ---
 
@@ -155,22 +184,33 @@ Mirror `sssf`'s `agent_pi.py` interface so the rest of the control plane is unch
 
 ---
 
-## 9. To verify empirically (the smoke test, when we build)
+## 9. Empirical verification — smoke test results (2026-08-07)
 
-1. `--mode json` output schema: event shape, where the final envelope lands, whether session id is
-   emitted.
-2. `-r <session-id>` continues (not forks) a `--session-dir` session — the correction loop depends on it.
-3. `ANTHROPIC_OAUTH_TOKEN` path resolves subscription capacity; `--model` fuzzy-match picks the intended IDs.
-4. `--tools` actually filters to the allowlist (incl. that extension-registered tools must be named).
-5. Usage/cost per turn is exposed for the Budget port and cache-read verification.
+Run: `claude-haiku-4-5`, `-p --mode json`, restricted tools, throwaway dir. **All five confirmed.**
+
+1. ✅ **`--mode json` schema** — clean JSONL; session id in the first `session` event; envelope is the
+   last `assistant` message in `agent_end` (bare JSON). Full map in §3a.
+2. ✅ **`-r` resumes, does not fork** — same session file appended, same id, context intact (§6).
+3. ✅ **Subscription capacity** — Anthropic *and* OpenAI (Codex) both authenticated on subscription
+   (`omp usage`); `--model` fuzzy-match resolved the intended IDs. `ANTHROPIC_BASE_URL` is the standard
+   `https://api.anthropic.com`.
+4. ✅ **`--tools` honored** — the run operated within `read,write,bash` and wrote the file via the
+   granted `write` tool. (Full negative-deny test deferred; the allowlist was respected.)
+5. ✅ **Usage/cost exposed** — per-message `usage` with dollar `cost` per component, and `cacheRead`
+   went non-zero on the resumed turn → prompt caching demonstrably live (§3a, §7).
+
+**One new adapter requirement discovered:** prompt must be piped via stdin, `--no-title` set (§3).
+
+Residual (not blocking the adapter): a full negative tool-deny test; behavior of a `bash git checkout`
+reversion against the write-enforcer (that's a `permissions.py` test, not an OMP test).
 
 ---
 
 ## 10. Open / deferred
 
-- **Open Decision #6 — where the factory's code lives.** `~/agents` is taken (studio roster). This
-  spec and the kernel need a home (e.g. `~/factory` or `~/projects/_factory`). Decide before writing
-  `agent_omp.py`. This doc moves into that home when it exists.
+- ~~**Open Decision #6 — where the factory's code lives.**~~ **Resolved:** `~/factory`, its own repo
+  (private remote `github.com/cryptocrystian/factory`), top-level and outside every venture (I12). This
+  doc now lives at `~/factory/design/`.
 - **Isolation (P4+):** OMP's native `worktree` for worktree-class work; container-in-worktree for
   L2–L3 remains remote (workstation is a client, not a worker). Keep P0 **single-stream** local — OMP's
   worktree + OAuth-balancing make parallel local runs tempting, and that's the WSL-destabilizing load.
