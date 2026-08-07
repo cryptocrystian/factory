@@ -199,7 +199,12 @@ Run: `claude-haiku-4-5`, `-p --mode json`, restricted tools, throwaway dir. **Al
 5. ✅ **Usage/cost exposed** — per-message `usage` with dollar `cost` per component, and `cacheRead`
    went non-zero on the resumed turn → prompt caching demonstrably live (§3a, §7).
 
-**One new adapter requirement discovered:** prompt must be piped via stdin, `--no-title` set (§3).
+**Two adapter requirements discovered:** (1) prompt must be piped via stdin, `--no-title` set (§3);
+(2) **OMP's tool vocabulary differs from sssf/Pi and `--tools` validates strictly (fails fast on an
+unknown name).** There is no `ls`/`find` — directory listing is `glob`. The valid set includes:
+`read, write, edit, bash, grep, glob, ast_grep, ast_edit, lsp, web_search, browser, computer, task,
+todo, github, memory_edit, recall, …`. The adapter needs a fixed sssf→OMP tool-name map; the
+read-only role set is `read, grep, glob` (+ `write` where the role emits a file).
 
 Residual (not blocking the adapter): a full negative tool-deny test; behavior of a `bash git checkout`
 reversion against the write-enforcer (that's a `permissions.py` test, not an OMP test).
