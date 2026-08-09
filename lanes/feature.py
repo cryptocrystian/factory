@@ -114,6 +114,38 @@ class Lane:
                        blocking=blocking)
         return run.finish(accepted, reason="" if accepted else f"L0={l0_ok} unit={unit_ok} approved={approved} blocking={blocking}")
 
+    def remediate(self, findings: str) -> bool:
+        """Close open review findings on an already-built journey: fix -> L0 -> test -> unit -> re-review."""
+        run = Run(self.repo, lane="remediate", target=self.journey)
+        run.tracer.log(event_detail="remediate_start", journey=self.journey)
+        (run.dir / "context.md").write_text(CanonResolver(self.repo).resolve(self.journey).markdown())
+        (run.dir / "findings.md").write_text(findings)
+
+        fix = self._agent(run, "builder", "build",
+                          prompt=("The reviewer found issues to close (findings.md in the added run dir). "
+                                  "Fix them in SOURCE only (no tests). Read context.md for the governing "
+                                  "canon. Self-verify gen:tokens/check:tokens/typecheck. Return your envelope."),
+                          cwd=self.repo, add_dirs=[run.dir], gate_fns=[gates.diff_matches_claims])
+        if fix is None:
+            return run.finish(False, reason="remediation build failed")
+        l0 = True
+        for g in [gates.cmd_gate("check:tokens", "npm run gen:tokens >/dev/null 2>&1; npm run check:tokens"),
+                  gates.cmd_gate("typecheck", "npm run typecheck")]:
+            rep = g(None, run); run.tracer.gate(rep); l0 = l0 and rep.passed
+        run.commit(getattr(fix, "commit_message", None) or f"fix({self.journey}): close review findings")
+
+        unit_ok = self._test(run)
+        review = self._agent(run, "reviewer", "review",
+                           prompt=("Re-review the journey after remediation. Confirm the previously-"
+                                   "reported findings (findings.md) are closed. You may run the gates. "
+                                   "Return your verdict envelope."),
+                           cwd=self.repo, add_dirs=[run.dir], gate_fns=[gates.verdict_consistent])
+        approved = bool(getattr(review, "approved", False)) if review else False
+        blocking = getattr(review, "blocking", []) if review else ["no review"]
+        accepted = l0 and unit_ok and approved
+        run.tracer.log(event_detail="verdict", l0=l0, unit=unit_ok, approved=approved, blocking=blocking)
+        return run.finish(accepted, reason="" if accepted else f"L0={l0} unit={unit_ok} approved={approved} blocking={blocking}")
+
     # -- phase helpers ---------------------------------------------------------
     def _agent(self, run, role, output_type, prompt, cwd, add_dirs, gate_fns, commit_msg=None):
         r = config.role(role)
@@ -188,10 +220,15 @@ def main(argv):
     ap.add_argument("--repo", required=True)
     ap.add_argument("--journey", required=True)
     ap.add_argument("--replay", default="", help="recorded run dir to replay envelopes from")
+    ap.add_argument("--remediate", default="", help="path to a findings file: run the fix->test->re-review loop")
     a = ap.parse_args(argv)
     live = not a.replay
     runner = ReplayRunner(Path(a.replay)) if a.replay else LiveRunner()
-    accepted = Lane(Path(a.repo), a.journey, runner, live).run()
+    lane = Lane(Path(a.repo), a.journey, runner, live)
+    if a.remediate:
+        accepted = lane.remediate(Path(a.remediate).read_text())
+    else:
+        accepted = lane.run()
     print(f"\nfeature lane -> accepted={accepted}")
     sys.exit(0 if accepted else 2)
 
