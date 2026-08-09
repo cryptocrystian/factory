@@ -1,49 +1,85 @@
-# P0 — the manual first run (log)
+# P0 — the manual first run (complete)
 
-Rev4 P0: *one lane by hand on a small greenfield project; every artifact written to a file; each named
-with what produced and consumed it.* The point is to make the design legible before automating — to
-separate the load-bearing phases from the ceremonial ones, and to discover what the control plane must
-own. Project: **Arxus**. Journey: **JRN-S1** (public valuation → emailed result).
+Rev4 P0: *one lane by hand on a small greenfield project; every artifact to a file; each named with
+what produced and consumed it.* The point is to make the design legible before automating — to find
+what the control plane must own. Project: **Arxus**. Journey: **JRN-S1** (public valuation → emailed
+result). Run: `2026-08-07-p0-jrn-s1`. **Outcome: the full run model executed end-to-end and the
+independent reviewer rejected with a real blocking defect — the verification stack working as designed.**
 
-Run id: `2026-08-07-p0-jrn-s1` (artifacts in `runs/<id>/`, gitignored — raw record).
+## Phase ledger (each an OMP call, driven by hand)
 
-## Phase ledger
+| # | Phase | Producer (model, family) | Gate | Result |
+|---|---|---|---|---|
+| 0 | context assembly | orchestrator | — | binding-resolution done by hand → `context.md` |
+| 1 | plan | planner · opus-5 · Anthropic | criterion→coverage | PASS; flagged OQ-4 canon gap |
+| — | canon amend | architect (human) | ratification (G1) | DEC-052 benchmark table |
+| 2 | build | builder · opus-5 · Anthropic | L0 (types/tokens) + write-grant | PASS; source-only (I6 honored) |
+| 3 | test-author | test-author · **gpt-5.6 · OpenAI** | AC coverage | **caught 2 real canon issues** (A, B) |
+| — | canon amend | architect (human) | ratification | DEC-053 ($2M basis), DEC-054 (aggregate comps) |
+| 3b | build-fix + test reconcile | builder + test-author | unit suite | 37/37 green — **but test-author breached tests-only grant** |
+| — | **enforcement** | orchestrator | I6 rollback | reverted, re-built clean, re-committed boundary |
+| 4 | review | reviewer · **gpt-5.6 · OpenAI** | verdict-consistent | **REJECTED — 1 blocking, 2 major** |
 
-| # | Phase | Producer | Consumes | Produces | Gate | Result |
-|---|---|---|---|---|---|---|
-| 0 | context assembly | orchestrator (by hand) | Arxus canon: JRN-S1, AC-S1-*, Valuation entity, INV-010, DDL, DEC-014/019, tokens | `runs/…/context.md` | — | the binding-resolution the control plane must automate |
-| 1 | plan | OMP planner · `claude-opus-5` high | `context.md` + canon (read-only) | `plan.md` (486 lines) + envelope | criterion→coverage | **PASS** (~$1.77, 27 tool calls) |
-| 2 | scaffold + build | *(pending)* | `plan.md` | Next.js+Supabase app + JRN-S1 feature | diff-matches-claims, writes-honored | — |
-| 3 | test-author | *(pending, ≠ builder family)* | `plan.md` §5 | tests | every AC has ≥1 assertion | — |
-| 4 | verify L0–L2 | code | repo | gate reports | fail-closed | — |
-| 5 | review | *(pending, ≠ builder family)* | plan + diff | review envelope | verdict-consistent | — |
+**Accepted = (tests green ∧ review approved). Review not approved → not accepted.** The correct outcome.
 
-## What P0 has taught so far (feeds the control plane)
+## What the independent verification caught (the whole point)
 
-**Binding resolution is the real work of intake.** Assembling the planner's context by hand (phase 0)
-made concrete what Rev4's binding-resolution must automate: given a journey, pull its acceptance
-criteria, the ontology entities it touches, their invariants/hardstops, the bound schema, the governing
-decisions, and the L0 design canon. `context.md` is the worked example the control plane generalizes.
+**Test-author (different family) caught two canon issues the builder couldn't:**
+- **A** — basis threshold: the table prose said SDE→EBITDA at ~$2M, the seed data said $5M. Material for
+  $2M–$5M businesses. → **DEC-053** (data corrected to $2M; engine records which earnings figure entered).
+- **B** — comps had no canon source (seed had none), so they were fabricated. → **DEC-054** (a comp is a
+  derived aggregate from `median_price`, never a fabricated transaction; source-tagged at the provider).
 
-**The Agent-port adapter contract, now verified end-to-end** (details in `FACTORY-HARNESS-SPEC.md`):
-- Prompt via **stdin**, not positional; `--no-title`.
-- OMP **tool vocabulary differs** from sssf/Pi and validates strictly — no `ls`/`find`; listing is
-  `glob`. Read-only role set = `read, grep, glob`.
-- `--mode json` is clean JSONL; **the envelope is the last `assistant` message** in `agent_end`
-  (bare JSON confirmed); usage/cost itemized per message in dollars; prompt-cache verifiably live.
-- `-r <id>` resumes the same session with context intact — the correction loop works.
-- `--system-prompt <file>` + `--add-dir <repo>` (read-only canon) + per-role `--tools` all behave.
+**Reviewer (different family) caught a blocking defect the tests missed:**
+- **BLOCKING · DEC-052 ratified-gate bypass** — `ratification.ts` checks `VALUATION_ALLOW_UNRATIFIED`
+  before `NODE_ENV`, so a production deploy with that flag set can expose the unratified table to a real
+  seller. Exactly what the launch gate exists to prevent. Tests only covered the flag='false' case.
+- **MAJOR · AC-S1-04 CTA** — the "next-step CTA" self-links (JRN-S2 doesn't exist yet; OQ-2). Not a real
+  next step; the tests assert the self-link, not the criterion.
+- **MAJOR · e2e harness** — no Playwright config scoping discovery; `test:e2e` fails loading Vitest specs.
+- **MINOR (unverified)** — integration/N1/N2 assertions unrun locally (no Docker).
 
-**The planner honored the invariants unprompted** — planned only what canon requires, refused to
-improvise governance (I7/I10): flagged 7 genuine canon gaps as open questions with safe defaults and
-single swap-points rather than deciding them. The load-bearing one:
+Reviewer also *verified the good*: 37/37 unit, typecheck, check:tokens, `next build` all pass; comps are
+provider aggregates anchored to median_price with no per-deal fields; basis + earnings_type recorded;
+disclaimer renders; service-role-only writes; INV-010/012 preserved.
 
-**Open canon gap (would escalate to ratification in the full factory):** OQ-4 — canon supplies no
-benchmark multiples/comps/SF structures for the valuation engine, though DEC-019 says P0 launches on
-"borrowed industry benchmarks." The plan uses clearly-labeled **seed placeholders** behind the
-source-tag seam. For P0-by-hand this is an accepted default; it should be ratified into canon before it
-is treated as real intelligence.
+## Lessons for the control plane (what P0 was for)
 
-## Cost
+1. **Commit every phase boundary.** The test-author edited 9 source files (I3 breach). Because the
+   build-fix wasn't committed first, the breach couldn't be attributed or rolled back cleanly — the two
+   agents' edits were intermingled. **The control plane must snapshot/commit before each phase so post-hoc
+   write-enforcement (I6) can attribute and roll back per-phase.** This is the single biggest P0 finding.
+2. **Write-enforcement is mandatory, not optional.** Run manually here, it caught the breach. Automated,
+   it is what makes I3 real.
+3. **Family diversity pays off twice.** The OpenAI test-author caught canon issues; the OpenAI reviewer
+   caught a compliance bug the tests missed. Neither shares the Anthropic builder's blind spot.
+4. **Binding resolution is the intake's real work** (phase 0 by hand → `context.md`).
+5. **Adapter contract fully verified** (see `FACTORY-HARNESS-SPEC.md`): stdin prompt, `--no-title`, OMP
+   tool vocabulary (`glob` not `ls`/`find`), JSONL envelope = last assistant message, `-r` resume,
+   per-message usage/cost, subscription for both families. New: **`-p` calls time out ~9.5min on big
+   builds → chain via `-r`; commit between.**
+6. **The local Docker gap is real** — L0/L1 gate locally; L2/L3 must run remote (workstation is a client).
 
-Plan phase ~$1.77 (opus-5/high). Smoke tests: cents (haiku).
+## Calibration (owner-requested)
+
+- **Produced:** Next.js+Supabase scaffold; JRN-S1 surface (form, result, permalink, API, service);
+  valuation engine (pure compute, provider over canon seed, ratification guard, mailer stub, event
+  writer); 26 source files; 7 test files (5 unit green = 37 assertions, integration + e2e authored for
+  remote). Canon grew by DEC-052/053/054 + the benchmark table.
+- **L0/L1 green locally:** check:tokens 0 violations, typecheck clean, `next build` OK, unit 37/37.
+- **Not accepted:** reviewer's blocking DEC-052 bypass + 2 majors open.
+- **Spend:** ~$24 list-equivalent captured (real higher — timed-out phases undercounted; ~6 build passes
+  from the resume-chaining + the enforcement redo). **Actual marginal ≈ $0 — both families ran on
+  subscription** (the 5h Anthropic window barely moved). The per-journey list-equivalent for a *clean*
+  run (no enforcement redo, fewer build chunks) would be materially lower — call it ~$8–12.
+- **Efficiency note:** the enforcement redo (my missed phase-boundary commit) roughly doubled the build
+  cost. Automating lesson #1 removes that.
+
+## Open, routed to the human
+
+- **Blocking:** fix the DEC-052 ratified-gate ordering (check env/NODE_ENV before the allow-flag; the
+  flag must never enable production exposure) + a test for the bypass. Small builder fix + test.
+- **Major:** decide the AC-S1-04 CTA (self-link acceptable for P0, or a real `/sell` stub?) and fix the
+  Playwright config so the e2e gate runs where infra exists.
+- **Recommended next journey:** JRN-B3 (NDA → tiered docs) or JRN-S4 (listing version snapshot) — both
+  P1, single-entity, and exercise RLS/invariants the valuation journey didn't.
