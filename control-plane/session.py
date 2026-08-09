@@ -29,7 +29,14 @@ class Run:
         self.tracer = Tracer(self.dir, self.run_id)
         self.accepted: bool | None = None
         self._base = self.git("rev-parse", "HEAD").strip()      # pin the base (I4-ish, local)
-        self.tracer.log(event_detail="run_start", workspace=str(self.workspace), base=self._base[:8])
+        # Isolation: run on a branch; only merge to the base when accepted (gated merge, Rev4 P5).
+        self.base_branch = self.git("rev-parse", "--abbrev-ref", "HEAD").strip()
+        self.work_branch = f"factory/{self.run_id}"
+        if self.dirty():
+            raise GitError("workspace is dirty; a run must start from a clean tree (I4)")
+        self.git("checkout", "-q", "-b", self.work_branch)
+        self.tracer.log(event_detail="run_start", workspace=str(self.workspace),
+                        base=self._base[:8], base_branch=self.base_branch, work_branch=self.work_branch)
 
     # ---- git in the workspace ------------------------------------------------
     def git(self, *args: str) -> str:
@@ -76,8 +83,20 @@ class Run:
 
     def finish(self, accepted: bool, reason: str = "") -> bool:
         self.accepted = accepted
-        self.tracer.log(event_detail="finish", accepted=accepted, reason=reason,
-                        cost_usd=self.tracer.total_cost())
+        # Gated merge: accepted -> merge the work branch into the base; else -> leave the base
+        # untouched (return the tree to base; the work branch remains for inspection).
+        merged = False
+        try:
+            if not self.dirty():
+                self.git("checkout", "-q", self.base_branch)
+                if accepted:
+                    self.git("-c", "commit.gpgsign=false", "merge", "--no-ff", "-q",
+                             "-m", f"merge {self.work_branch} (accepted)", self.work_branch)
+                    merged = True
+        except GitError as e:
+            self.tracer.log(event_detail="merge_error", error=str(e))
+        self.tracer.log(event_detail="finish", accepted=accepted, reason=reason, merged=merged,
+                        work_branch=self.work_branch, cost_usd=self.tracer.total_cost())
         return accepted
 
 

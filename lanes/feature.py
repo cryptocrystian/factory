@@ -21,6 +21,8 @@ from pathlib import Path
 CP = Path(__file__).resolve().parent.parent / "control-plane"
 sys.path.insert(0, str(CP))
 
+MAX_FIX_ITERS = 3          # bounded fix loop (I9): converge or escalate
+
 import config, omp, gates, permissions as perm
 import envelopes as E
 from canon import CanonResolver
@@ -102,49 +104,19 @@ class Lane:
         unit_ok = self._test(run)
 
         # -- review (different family; read-only) + verdict gate ---------------
-        review = self._agent(run, "reviewer", "review",
-                            prompt=self._reviewer_prompt(run),
-                            cwd=self.repo, add_dirs=[run.dir],
-                            gate_fns=[gates.verdict_consistent])
-        approved = bool(getattr(review, "approved", False)) if review else False
-
-        accepted = l0_ok and unit_ok and approved
-        blocking = getattr(review, "blocking", []) if review else ["no review"]
-        run.tracer.log(event_detail="verdict", l0=l0_ok, unit=unit_ok, approved=approved,
-                       blocking=blocking)
-        return run.finish(accepted, reason="" if accepted else f"L0={l0_ok} unit={unit_ok} approved={approved} blocking={blocking}")
+        approved, findings, review = self._review(run)
+        accepted = l0_ok and unit_ok[0] and approved
+        if not accepted:
+            accepted = self._converge(run, findings, unit_ok[1])
+        return run.finish(accepted, reason="" if accepted else "did not converge")
 
     def remediate(self, findings: str) -> bool:
-        """Close open review findings on an already-built journey: fix -> L0 -> test -> unit -> re-review."""
+        """Close open review findings on an already-built journey, via the bounded fix loop."""
         run = Run(self.repo, lane="remediate", target=self.journey)
         run.tracer.log(event_detail="remediate_start", journey=self.journey)
         (run.dir / "context.md").write_text(CanonResolver(self.repo).resolve(self.journey).markdown())
-        (run.dir / "findings.md").write_text(findings)
-
-        fix = self._agent(run, "builder", "build",
-                          prompt=("The reviewer found issues to close (findings.md in the added run dir). "
-                                  "Fix them in SOURCE only (no tests). Read context.md for the governing "
-                                  "canon. Self-verify gen:tokens/check:tokens/typecheck. Return your envelope."),
-                          cwd=self.repo, add_dirs=[run.dir], gate_fns=[gates.diff_matches_claims])
-        if fix is None:
-            return run.finish(False, reason="remediation build failed")
-        l0 = True
-        for g in [gates.cmd_gate("check:tokens", "npm run gen:tokens >/dev/null 2>&1; npm run check:tokens"),
-                  gates.cmd_gate("typecheck", "npm run typecheck")]:
-            rep = g(None, run); run.tracer.gate(rep); l0 = l0 and rep.passed
-        run.commit(getattr(fix, "commit_message", None) or f"fix({self.journey}): close review findings")
-
-        unit_ok = self._test(run)
-        review = self._agent(run, "reviewer", "review",
-                           prompt=("Re-review the journey after remediation. Confirm the previously-"
-                                   "reported findings (findings.md) are closed. You may run the gates. "
-                                   "Return your verdict envelope."),
-                           cwd=self.repo, add_dirs=[run.dir], gate_fns=[gates.verdict_consistent])
-        approved = bool(getattr(review, "approved", False)) if review else False
-        blocking = getattr(review, "blocking", []) if review else ["no review"]
-        accepted = l0 and unit_ok and approved
-        run.tracer.log(event_detail="verdict", l0=l0, unit=unit_ok, approved=approved, blocking=blocking)
-        return run.finish(accepted, reason="" if accepted else f"L0={l0} unit={unit_ok} approved={approved} blocking={blocking}")
+        accepted = self._converge(run, [findings], "")
+        return run.finish(accepted, reason="" if accepted else "did not converge")
 
     # -- phase helpers ---------------------------------------------------------
     def _agent(self, run, role, output_type, prompt, cwd, add_dirs, gate_fns, commit_msg=None):
@@ -189,15 +161,53 @@ class Lane:
         run.commit(getattr(env, "commit_message", None) or f"build: {self.journey}")
         return l0
 
-    def _test(self, run) -> bool:
-        env = self._agent(run, "test-author", "test",
-                         prompt=self._test_prompt(run),
-                         cwd=self.repo, add_dirs=[run.dir],
-                         gate_fns=[])
+    def _test(self, run, prompt=None) -> tuple[bool, str]:
+        self._agent(run, "test-author", "test",
+                    prompt=prompt or self._test_prompt(run),
+                    cwd=self.repo, add_dirs=[run.dir], gate_fns=[])
         rep = gates.cmd_gate("test:unit", "npm run test:unit")(None, run)
         run.tracer.gate(rep)
         run.commit(f"test: {self.journey} acceptance tests")
-        return rep.passed
+        return rep.passed, rep.evidence
+
+    def _review(self, run):
+        review = self._agent(run, "reviewer", "review",
+                           prompt=self._reviewer_prompt(run),
+                           cwd=self.repo, add_dirs=[run.dir],
+                           gate_fns=[gates.verdict_consistent])
+        approved = bool(getattr(review, "approved", False)) if review else False
+        blocking = getattr(review, "blocking", []) if review else ["no review envelope"]
+        run.tracer.log(event_detail="review_verdict", approved=approved, blocking=blocking)
+        return approved, blocking, review
+
+    def _converge(self, run, findings, unit_evidence) -> bool:
+        """Bounded fix loop: re-route findings + failing-gate output to the builder until accepted."""
+        for i in range(1, MAX_FIX_ITERS + 1):
+            run.tracer.log(event_detail="fix_iter", i=i, findings=findings)
+            fixmd = "# Findings to close\n\n" + "\n".join(f"- {f}" for f in findings)
+            if unit_evidence:
+                fixmd += f"\n\n## Failing unit output\n```\n{unit_evidence[-1500:]}\n```"
+            (run.dir / f"findings-{i}.md").write_text(fixmd)
+            fix = self._agent(run, "builder", "build",
+                             prompt=(f"Close the findings in findings-{i}.md (added run dir), SOURCE only. "
+                                     "Read context.md for governing canon. Self-verify "
+                                     "gen:tokens/check:tokens/typecheck. Return your envelope."),
+                             cwd=self.repo, add_dirs=[run.dir], gate_fns=[gates.diff_matches_claims])
+            l0 = True
+            for g in [gates.cmd_gate("check:tokens", "npm run gen:tokens >/dev/null 2>&1; npm run check:tokens"),
+                      gates.cmd_gate("typecheck", "npm run typecheck")]:
+                rep = g(None, run); run.tracer.gate(rep); l0 = l0 and rep.passed
+            run.commit(getattr(fix, "commit_message", None) or f"fix({self.journey}): iter {i}")
+            unit_ok, unit_evidence = self._test(
+                run, prompt=("Reconcile/extend the acceptance tests to the current source and the findings "
+                             f"in findings-{i}.md. Run npm run test:unit; leave a real defect failing and "
+                             "name it. Tests only. Return your envelope."))
+            approved, findings, _ = self._review(run)
+            if l0 and unit_ok and approved:
+                run.tracer.log(event_detail="converged", iter=i)
+                return True
+        run.tracer.log(event_detail="not_converged", iters=MAX_FIX_ITERS)
+        return False
 
     # -- prompts (live only; replay ignores them) ------------------------------
     def _planner_prompt(self, run):
