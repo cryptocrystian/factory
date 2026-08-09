@@ -13,7 +13,9 @@ def artifacts_exist(env: EnvelopeBase, run) -> GateReport:
     arts = getattr(env, "artifacts", None) or getattr(env, "changed_files", None) or []
     checks = []
     for a in arts:
-        p = run.workspace / a
+        p = run.dir / a                          # plans live in the run dir; source in the workspace
+        if not p.exists():
+            p = run.workspace / a
         checks.append({"item": a, "ok": p.exists(),
                        "note": f"{p.stat().st_size}B" if p.exists() else "missing"})
     passed = all(c["ok"] for c in checks) if checks else False

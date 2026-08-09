@@ -17,8 +17,8 @@ class Tracer:
         self.run_id = run_id
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
-    def _emit(self, kind: str, **fields):
-        rec = {"ts": round(time.time(), 3), "run": self.run_id, "event": kind, **fields}
+    def _emit(self, evt: str, **fields):
+        rec = {"ts": round(time.time(), 3), "run": self.run_id, "event": evt, **fields}
         with self.path.open("a") as f:
             f.write(json.dumps(rec) + "\n")
 
