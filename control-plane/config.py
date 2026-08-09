@@ -64,3 +64,35 @@ def role(name: str) -> Role:
     if name not in ROLES:
         raise KeyError(f"unknown role {name!r}; known: {list(ROLES)}")
     return ROLES[name]
+
+
+# --------------------------------------------------------------------------- design (anti-slop) opt-in
+@dataclass(frozen=True)
+class DesignPolicy:
+    """A repo's opt-in to the Impeccable anti-slop gate. Absent (None) = the gate never runs."""
+    detect_paths: str                            # dirs the detector scans (missing ones are skipped)
+    impeccable_version: str                      # pinned CLI version, "" = unpinned
+
+
+def design_policy(repo_path) -> "DesignPolicy | None":
+    """Read this repo's design-gate opt-in from registry.yml. Returns None when the repo is absent,
+    hasn't opted in (design.enabled falsy), or yaml is unavailable — in every case the gate is simply
+    off, so the control plane degrades safely. Matched by resolved filesystem path, not repo name."""
+    try:
+        import yaml
+    except Exception:
+        return None
+    reg = FACTORY_ROOT / "registry.yml"
+    if not reg.exists():
+        return None
+    data = yaml.safe_load(reg.read_text()) or {}
+    want = Path(repo_path).expanduser().resolve()
+    for _name, spec in (data.get("repos") or {}).items():
+        p = (spec or {}).get("path")
+        if p and Path(p).expanduser().resolve() == want:
+            d = (spec.get("design") or {})
+            if not d.get("enabled"):
+                return None
+            return DesignPolicy(detect_paths=str(d.get("detect_paths", "app src components")),
+                                impeccable_version=str(d.get("impeccable_version", "")))
+    return None

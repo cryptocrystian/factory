@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["pydantic>=2"]
+# dependencies = ["pydantic>=2", "pyyaml>=6"]
 # ///
 """The feature lane — the factory running a journey end to end, in code (I1).
 
@@ -74,6 +74,7 @@ class Lane:
         self.journey = journey
         self.runner = runner
         self.live = live
+        self.design = config.design_policy(self.repo)   # None unless the repo opts into the anti-slop gate
 
     def run(self) -> bool:
         run = Run(self.repo, lane="feature", target=self.journey)
@@ -153,13 +154,28 @@ class Lane:
                          gate_fns=[gates.diff_matches_claims])
         if env is None:
             return False
-        # L0 gates against the repo
+        # L0 gates against the repo (design:slop appended only when the repo opts in — I8)
         l0 = True
-        for g in [gates.cmd_gate("check:tokens", "npm run gen:tokens >/dev/null 2>&1; npm run check:tokens"),
-                  gates.cmd_gate("typecheck", "npm run typecheck")]:
+        for g in self._l0_gates():
             rep = g(None, run); run.tracer.gate(rep); l0 = l0 and rep.passed
         run.commit(getattr(env, "commit_message", None) or f"build: {self.journey}")
         return l0
+
+    def _l0_gates(self):
+        """The deterministic L0 command gates, plus the anti-slop design gate for opted-in repos."""
+        gs = [gates.cmd_gate("check:tokens", "npm run gen:tokens >/dev/null 2>&1; npm run check:tokens"),
+              gates.cmd_gate("typecheck", "npm run typecheck")]
+        if self.design:
+            gs.append(gates.impeccable_gate(self.design.impeccable_version, self.design.detect_paths))
+        return gs
+
+    def _design_selfcheck(self) -> str:
+        """A builder-prompt clause telling opted-in repos to clear the detector before returning."""
+        if not self.design:
+            return ""
+        return (f" This repo enforces the anti-slop design gate: run "
+                f"`npx impeccable detect {self.design.detect_paths}` and clear every finding, "
+                f"honoring DESIGN.md and .impeccable/config.json.")
 
     def _test(self, run, prompt=None) -> tuple[bool, str]:
         self._agent(run, "test-author", "test",
@@ -191,11 +207,11 @@ class Lane:
             fix = self._agent(run, "builder", "build",
                              prompt=(f"Close the findings in findings-{i}.md (added run dir), SOURCE only. "
                                      "Read context.md for governing canon. Self-verify "
-                                     "gen:tokens/check:tokens/typecheck. Return your envelope."),
+                                     "gen:tokens/check:tokens/typecheck." + self._design_selfcheck()
+                                     + " Return your envelope."),
                              cwd=self.repo, add_dirs=[run.dir], gate_fns=[gates.diff_matches_claims])
             l0 = True
-            for g in [gates.cmd_gate("check:tokens", "npm run gen:tokens >/dev/null 2>&1; npm run check:tokens"),
-                      gates.cmd_gate("typecheck", "npm run typecheck")]:
+            for g in self._l0_gates():
                 rep = g(None, run); run.tracer.gate(rep); l0 = l0 and rep.passed
             run.commit(getattr(fix, "commit_message", None) or f"fix({self.journey}): iter {i}")
             unit_ok, unit_evidence = self._test(
@@ -215,7 +231,8 @@ class Lane:
                 "exactly per your system instructions.")
     def _builder_prompt(self, run, plan):
         return ("Read plan.md in the added run dir and context.md; implement the journey as source "
-                "only (no tests). Self-verify gen:tokens/check:tokens/typecheck. Return your envelope.")
+                "only (no tests). Self-verify gen:tokens/check:tokens/typecheck."
+                + self._design_selfcheck() + " Return your envelope.")
     def _test_prompt(self, run):
         return ("Read the acceptance criteria in context.md and the built source; write the acceptance "
                 "tests under tests/ (unit runnable, integration/e2e authored). Run npm run test:unit. "

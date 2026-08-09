@@ -1,5 +1,14 @@
 # Portfolio registry — which repos the factory operates on, and their lane opt-ins.
 # A repo is only touched by lanes it explicitly opts into.
+#
+# design: (optional) opt a UI repo into the deterministic anti-slop gate (control-plane/gates.py
+#   impeccable_gate), run in the build L0 tier alongside typecheck/check:tokens. Keep enabled:false
+#   until the repo has a ratified DESIGN.md + .impeccable/config.json (brand fonts/tokens declared) —
+#   without them the brand font reads as an 'overused-font' finding and the gate false-fails.
+#     design:
+#       enabled: true
+#       detect_paths: app src components   # dirs Impeccable scans (missing dirs skipped safely)
+#       impeccable_version: "3.5.0"        # pinned for reproducible runs
 
 repos:
   arxus:
@@ -9,3 +18,7 @@ repos:
     canon: canon/            # canon lives at repo root
     status: p0               # first by-hand run; no lanes automated yet
     lanes: []                # opt-ins added as lanes come online
+    design:                  # anti-slop gate — DORMANT until taste-intake produces DESIGN.md + config
+      enabled: false
+      detect_paths: app src components
+      impeccable_version: "3.5.0"

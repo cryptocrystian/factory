@@ -71,3 +71,19 @@ def cmd_gate(name: str, command: str):
                           checks=[{"item": command, "ok": p.returncode == 0}],
                           evidence=tail if p.returncode != 0 else f"{name} exit 0")
     return _gate
+
+
+def impeccable_gate(version: str, paths: str):
+    """Anti-slop design gate (I8): the Impeccable detector must find no non-advisory findings.
+
+    Deterministic and LLM-free — a peer of typecheck/check:tokens, run in the build L0 tier. The
+    detector exits 2 when a warning/error-severity slop pattern is present (overused font, muddy
+    color pair, bounce easing, off-token spacing…) and 0 when clean; the human-readable findings
+    become the gate evidence and route back to the builder like any failing L0 gate. Missing scan
+    dirs are skipped (exit 0), so `paths` may list more than a given repo has.
+
+    Opt-in per repo (registry.yml `design.enabled`). Enable ONLY once the repo has a ratified
+    DESIGN.md + .impeccable/config.json declaring its fonts/tokens — otherwise the brand font reads
+    as an 'overused-font' finding and the gate false-fails. Version is pinned for reproducibility."""
+    ver = f"@{version}" if version else ""
+    return cmd_gate("design:slop", f"npx --yes impeccable{ver} detect {paths}")
