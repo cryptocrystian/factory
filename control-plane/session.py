@@ -26,7 +26,7 @@ class Run:
         self.run_id = run_id or f"{time.strftime('%Y-%m-%d-%H%M%S')}-{lane}-{target}"
         self.dir = config.RUNS_DIR / self.run_id
         self.dir.mkdir(parents=True, exist_ok=True)
-        self.tracer = Tracer(self.dir, self.run_id)
+        self.tracer = Tracer(self.dir, self.run_id, lane=lane, target=target)
         self.accepted: bool | None = None
         self._base = self.git("rev-parse", "HEAD").strip()      # pin the base (I4-ish, local)
         # Isolation: run on a branch; only merge to the base when accepted (gated merge, Rev4 P5).

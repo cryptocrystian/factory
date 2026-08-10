@@ -10,17 +10,30 @@ import json
 import time
 from pathlib import Path
 
+import obsdb
+
 
 class Tracer:
-    def __init__(self, run_dir: Path, run_id: str):
+    def __init__(self, run_dir: Path, run_id: str, lane: str | None = None, target: str | None = None):
         self.path = run_dir / "trace.jsonl"
         self.run_id = run_id
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # SQLite mirror — the queryable store the observability UI reads. Never let it break a run.
+        try:
+            self._db = obsdb.connect()
+            obsdb.upsert_run(self._db, run_id, lane=lane, target=target, started_at=round(time.time(), 3))
+        except Exception:
+            self._db = None
 
     def _emit(self, evt: str, **fields):
         rec = {"ts": round(time.time(), 3), "run": self.run_id, "event": evt, **fields}
         with self.path.open("a") as f:
             f.write(json.dumps(rec) + "\n")
+        if self._db is not None:
+            try:
+                obsdb.record_event(self._db, self.run_id, rec)
+            except Exception:
+                pass  # observability must never break a run
 
     def phase_start(self, name, kind, owner):
         self._emit("phase_start", phase=name, kind=kind, owner=owner)
