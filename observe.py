@@ -191,6 +191,30 @@ display:flex;align-items:center;gap:10px;margin:6px 0 2px}
 .marker .lbl{color:var(--accent);text-transform:uppercase;letter-spacing:.08em;font-size:10.5px}
 .empty{color:var(--mute);padding:40px;text-align:center;font-family:var(--mono);font-size:13px}
 .ev{font-family:var(--mono);font-size:11px;color:var(--mute);white-space:pre-wrap;word-break:break-word;margin-top:2px}
+.viewtabs{display:flex;gap:5px;margin:16px 0 4px}
+.viewtabs button{font-family:var(--mono);font-size:11px;padding:5px 13px;border:1px solid var(--brd);background:var(--surf);color:var(--dim);border-radius:3px;cursor:pointer;letter-spacing:.04em}
+.viewtabs button.on{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
+.flow{display:flex;flex-direction:column;gap:20px;padding:14px 0 50px}
+.track .tlabel{font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--mute);margin-bottom:9px;display:flex;align-items:center;gap:9px}
+.track .tlabel::after{content:"";flex:1;height:1px;background:var(--brd)}
+.nodes{display:flex;align-items:stretch;overflow-x:auto;padding-bottom:8px}
+.fnode{flex:none;min-width:106px;border:1px solid var(--brd);border-radius:7px;background:var(--surf);padding:10px 12px;display:flex;flex-direction:column;gap:5px;position:relative}
+.fnode.agent{border-top:2px solid var(--accent)}
+.fnode.code{border-top:2px solid var(--info)}
+.fnode.gate{min-width:0;flex-direction:row;align-items:center;gap:8px;background:var(--surf2);padding:10px 12px}
+.fnode.gate.ok{border-color:color-mix(in srgb,var(--pass) 55%,var(--brd))}
+.fnode.gate.no{border-color:var(--fail);background:color-mix(in srgb,var(--fail) 14%,var(--surf))}
+.fnode.verdict.ok{border-color:color-mix(in srgb,var(--pass) 60%,var(--brd))}
+.fnode.verdict.no{border-color:var(--fail)}
+.fnode.final{border:1.5px solid var(--accent);background:color-mix(in srgb,var(--accent) 9%,var(--surf))}
+.fnode .fnt{font-family:var(--mono);font-size:9px;letter-spacing:.07em;text-transform:uppercase;color:var(--mute)}
+.fnode .fnn{font-size:13px;font-weight:600;letter-spacing:-.01em;white-space:nowrap}
+.fnode .fns{font-family:var(--mono);font-size:10.5px;color:var(--dim);white-space:nowrap}
+.fst{position:absolute;top:8px;right:9px;width:7px;height:7px;border-radius:50%}
+.gicon{width:16px;height:16px;border-radius:4px;display:grid;place-items:center;font-size:10px;color:#fff;flex:none}
+.gicon.ok{background:var(--pass)}.gicon.no{background:var(--fail)}
+.farrow{flex:none;align-self:center;color:var(--mute);padding:0 4px;font-size:13px}
+.to-badge{position:absolute;bottom:6px;right:9px;font-family:var(--mono);font-size:8.5px;color:var(--wait)}
 </style></head><body>
 <header>
   <span class="brand">Factory · Observatory</span>
@@ -255,29 +279,79 @@ function marker(m){
   else {const s=JSON.stringify(data);if(s!=="{}")d.append(el("div","ev",s.slice(0,400)));}
   return d;
 }
+let view="flow";
+function renderTimeline(tlData){
+  const tl=el("div","tl");
+  (tlData||[]).forEach(t=>{
+    if(t.type==="phase")tl.append(phaseCard(t));
+    else if(t.type==="iter")tl.append(el("div","iter","fix iteration "+t.i));
+    else if(t.type==="gate")tl.append((()=>{const g=el("div","gate-solo");g.append(gchip(t));return g})());
+    else if(t.type==="call")tl.append((()=>{const w=el("div","gate-solo");w.append(callRow(t));return w})());
+    else if(t.type==="marker")tl.append(marker(t));
+  });
+  if(!tl.children.length)tl.append(el("div","empty","No phases recorded for this run."));
+  return tl;
+}
+// -- flow view: the assembly line. One track per attempt; nodes flow left->right through the gates.
+function buildTracks(tlData){
+  const tracks=[]; let cur={label:"run",nodes:[]}; tracks.push(cur);
+  const P=n=>cur.nodes.push(n);
+  (tlData||[]).forEach(t=>{
+    if(t.type==="iter"){cur={label:"fix "+t.i,nodes:[]};tracks.push(cur)}
+    else if(t.type==="phase"){
+      const call=(t.items||[]).find(i=>i.kind==="call");
+      P({c:t.kind==="agent"?"agent":"code",nt:t.kind,nn:t.name,
+         ns:call?("$"+(call.cost||0).toFixed(2)):(t.owner||""),st:t.status,to:call&&call.timed_out});
+      (t.items||[]).filter(i=>i.kind==="gate").forEach(g=>P({c:"gate",nn:g.gate,passed:g.passed}));
+    }
+    else if(t.type==="gate")P({c:"gate",nn:t.gate,passed:t.passed});
+    else if(t.type==="call")P({c:"agent",nt:"agent",nn:t.role,ns:"$"+(t.cost||0).toFixed(2),to:t.timed_out});
+    else if(t.type==="marker"){const dd=t.data||{};
+      if(t.detail==="review_verdict")P({c:"verdict",nt:"review",nn:dd.approved?"approved":"rejected",passed:dd.approved});
+      else if(t.detail==="finish")P({c:"final",nt:"verdict",nn:dd.accepted?"ACCEPTED":"not accepted",
+        ns:(dd.merged?"merged · ":"")+"$"+(dd.cost_usd||0).toFixed(2),passed:dd.accepted});
+    }
+  });
+  return tracks.filter(t=>t.nodes.length);
+}
+function fnode(n){
+  if(n.c==="gate"){const g=el("div","fnode gate "+(n.passed?"ok":"no"));
+    g.append(el("span","gicon "+(n.passed?"ok":"no"),n.passed?"✓":"✗"), el("span","fns",n.nn));return g}
+  const d=el("div","fnode "+n.c+(n.c==="verdict"?(n.passed?" ok":" no"):""));
+  if(n.nt)d.append(el("div","fnt",n.nt));
+  d.append(el("div","fnn",n.nn));
+  if(n.ns)d.append(el("div","fns",n.ns));
+  if(n.st)d.append(el("span","fst "+(n.st==="success"?"d-ok":n.st==="running"?"d-run":"d-fail")));
+  if(n.to)d.append(el("div","to-badge","↻ resumed"));
+  return d;
+}
+function renderFlow(tlData){
+  const wrap=el("div","flow");
+  buildTracks(tlData).forEach(tr=>{
+    const t=el("div","track");
+    t.append(el("div","tlabel",tr.label));
+    const row=el("div","nodes");
+    tr.nodes.forEach((n,i)=>{ if(i)row.append(el("span","farrow","→")); row.append(fnode(n)) });
+    t.append(row); wrap.append(t);
+  });
+  if(!wrap.children.length)wrap.append(el("div","empty","No phases recorded for this run."));
+  return wrap;
+}
 function loadDetail(id){
   fetch("/api/runs/"+id).then(r=>r.json()).then(run=>{
     if(sel!==id)return;
     const d=$("#detail");d.innerHTML="";
     const head=el("div","dhead");
-    head.append(el("h1",null,run.target||run.run_id));
-    head.append(el("span","lane",run.lane||""));
-    const kv=el("div","kv");
-    const [,lbl]=runStatus(run);
+    head.append(el("h1",null,run.target||run.run_id), el("span","lane",run.lane||""));
+    const kv=el("div","kv");const [,lbl]=runStatus(run);
     kv.innerHTML="<span>status <b>"+lbl+"</b></span><span>cost <b>"+money(run.cost_usd)+"</b></span>"+
-      "<span>branch <b>"+(run.work_branch? run.work_branch.replace('factory/','…/') :"—")+"</b></span>";
+      "<span>branch <b>"+(run.work_branch?run.work_branch.replace('factory/','…/'):"—")+"</b></span>";
     head.append(kv);d.append(head);
     if(run.reason)d.append(el("div","reason",run.reason));
-    const tl=el("div","tl");
-    (run.timeline||[]).forEach(t=>{
-      if(t.type==="phase")tl.append(phaseCard(t));
-      else if(t.type==="iter")tl.append(el("div","iter","fix iteration "+t.i));
-      else if(t.type==="gate")tl.append((()=>{const g=el("div","gate-solo");g.append(gchip(t));return g})());
-      else if(t.type==="call")tl.append((()=>{const w=el("div","gate-solo");w.append(callRow(t));return w})());
-      else if(t.type==="marker")tl.append(marker(t));
-    });
-    if(!tl.children.length)tl.append(el("div","empty","No phases recorded for this run."));
-    d.append(tl);
+    const tabs=el("div","viewtabs");
+    ["flow","timeline"].forEach(v=>{const b=el("button",view===v?"on":null,v);b.onclick=()=>{view=v;loadDetail(id)};tabs.append(b)});
+    d.append(tabs);
+    d.append(view==="flow"?renderFlow(run.timeline):renderTimeline(run.timeline));
   });
 }
 function poll(){fetch("/api/runs").then(r=>r.json()).then(d=>{runs=d.runs||[];renderList();if(sel)loadDetail(sel)}).catch(()=>{})}
