@@ -119,6 +119,27 @@ class Lane:
         accepted = self._converge(run, [findings], "")
         return run.finish(accepted, reason="" if accepted else "did not converge")
 
+    def foundation(self, brief: str) -> bool:
+        """Build a foundation (auth, infra…) from a brief instead of a canon journey — same machinery.
+        The brief IS the context/spec; the planner turns it into a plan, then build→verify→review→converge."""
+        run = Run(self.repo, lane="foundation", target=self.journey)
+        run.tracer.log(event_detail="foundation_start", target=self.journey)
+        (run.dir / "context.md").write_text(brief)
+        plan = self._agent(run, "planner", "plan",
+                           prompt=("Read context.md — a foundation brief (a cross-cutting build, not a "
+                                   "single user journey). Produce plan.md and your envelope per your "
+                                   "system instructions."),
+                           cwd=run.dir, add_dirs=[self.repo], gate_fns=[gates.artifacts_exist])
+        if plan is None:
+            return run.finish(False, reason="planning failed")
+        l0_ok = self._build(run, plan)
+        unit_ok = self._test(run)
+        approved, findings, _ = self._review(run)
+        accepted = l0_ok and unit_ok[0] and approved
+        if not accepted:
+            accepted = self._converge(run, findings, unit_ok[1])
+        return run.finish(accepted, reason="" if accepted else "did not converge")
+
     # -- phase helpers ---------------------------------------------------------
     def _agent(self, run, role, output_type, prompt, cwd, add_dirs, gate_fns, commit_msg=None):
         r = config.role(role)
@@ -248,12 +269,15 @@ def main(argv):
     ap.add_argument("--journey", required=True)
     ap.add_argument("--replay", default="", help="recorded run dir to replay envelopes from")
     ap.add_argument("--remediate", default="", help="path to a findings file: run the fix->test->re-review loop")
+    ap.add_argument("--foundation", default="", help="path to a brief file: build a foundation (not a canon journey)")
     a = ap.parse_args(argv)
     live = not a.replay
     runner = ReplayRunner(Path(a.replay)) if a.replay else LiveRunner()
     lane = Lane(Path(a.repo), a.journey, runner, live)
     if a.remediate:
         accepted = lane.remediate(Path(a.remediate).read_text())
+    elif a.foundation:
+        accepted = lane.foundation(Path(a.foundation).read_text())
     else:
         accepted = lane.run()
     print(f"\nfeature lane -> accepted={accepted}")
