@@ -18,10 +18,123 @@ import json
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs
 
-CP = Path(__file__).resolve().parent / "control-plane"
+import yaml
+
+FACTORY_ROOT = Path(__file__).resolve().parent
+RUNS_DIR = FACTORY_ROOT / "runs"
+DECISIONS = RUNS_DIR / "decisions.yml"
+BACKLOG = FACTORY_ROOT / "backlog.yml"
+CP = FACTORY_ROOT / "control-plane"
 sys.path.insert(0, str(CP))
 import obsdb
+
+
+# ----------------------------------------------------------------------------- drill-down
+def _clip(v, n=600):
+    s = v if isinstance(v, str) else json.dumps(v)
+    return s if len(s) <= n else s[:n] + " …"
+
+
+def _text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
+    return ""
+
+
+def parse_stream(path: Path) -> dict:
+    """Parse one OMP session file (internal format: `message` + `custom` tool events) into a readable
+    activity trail — what the agent said and did — plus the prompt it got and the envelope it returned."""
+    activity, cost, session_id, envelope, prompt = [], 0.0, None, "", ""
+    for ln in path.read_text().splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            e = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        t = e.get("type")
+        if t == "session":
+            session_id = session_id or e.get("id")
+        elif t == "message":
+            m = e.get("message") or {}
+            role, txt = m.get("role"), _text_of(m.get("content"))
+            u = m.get("usage") or {}
+            if isinstance(u.get("cost"), dict):
+                cost = max(cost, float(u["cost"].get("total", 0)))
+            if role == "assistant" and txt.strip():
+                activity.append({"kind": "say", "text": _clip(txt, 700)}); envelope = txt.strip()
+            elif role == "user" and not prompt and txt.strip():
+                prompt = _clip(txt, 600)
+            elif role == "tool":                              # tool result → attach to the last tool call
+                res = txt or _clip(m.get("content"), 400)
+                for a in reversed(activity):
+                    if a["kind"] == "tool" and not a.get("result"):
+                        a["result"] = _clip(res, 400); break
+        elif t == "custom" and e.get("customType") == "tool_execution_start":
+            d = e.get("data") or {}
+            activity.append({"kind": "tool", "name": d.get("toolName"),
+                             "args": _clip(d.get("args", {}), 300), "result": "", "error": False})
+    return {"activity": activity, "envelope": _clip(envelope, 1400), "cost": round(cost, 4),
+            "session_id": session_id, "prompt": prompt,
+            "tools": sum(1 for a in activity if a["kind"] == "tool")}
+
+
+def phase_stream(run_id: str, role: str, seq: int) -> dict | None:
+    rd = RUNS_DIR / run_id
+    sess = rd / "sessions" / role
+    files = sorted(sess.glob("*.jsonl")) if sess.exists() else []
+    path = files[seq] if 0 <= seq < len(files) else (rd / f"{role}.jsonl" if (rd / f"{role}.jsonl").exists() else None)
+    if not path:
+        return None
+    out = parse_stream(path)
+    # attach the brief the agent worked from, if present
+    for name in ("context.md", "plan.md"):
+        p = rd / name
+        if p.exists() and "context" not in out:
+            out["context_present"] = True
+    return out
+
+
+# ----------------------------------------------------------------------------- decisions
+def load_decisions():
+    if not DECISIONS.exists():
+        return {"decisions": []}
+    return yaml.safe_load(DECISIONS.read_text()) or {"decisions": []}
+
+
+def save_decisions(data):
+    DECISIONS.write_text("# Decisions queue — escalations + ratifications awaiting the human, with copilot analysis.\n"
+                         + yaml.safe_dump(data, sort_keys=False, default_flow_style=False))
+
+
+def record_decision(did, action, note):
+    """Record a human ruling: update the decision, and advance the backlog item when all its
+    decisions are resolved (a fix/launch-gate approval sets the item ready; a reject leaves it)."""
+    data = load_decisions()
+    dec = next((d for d in data["decisions"] if d["id"] == did), None)
+    if not dec:
+        return {"error": "unknown decision"}
+    dec["status"] = "approved" if action and not action.lower().startswith(("reject", "defer")) else action.lower().split()[0]
+    dec["human_action"] = action
+    dec["human_note"] = note
+    save_decisions(data)
+    # advance the backlog if every decision for this item is now approved
+    bid = dec.get("backlog_id")
+    if bid and BACKLOG.exists():
+        siblings = [d for d in data["decisions"] if d.get("backlog_id") == bid]
+        if all(s["status"] == "approved" for s in siblings):
+            bl = yaml.safe_load(BACKLOG.read_text()) or {}
+            for it in bl.get("items", []):
+                if it["id"] == bid and it.get("kind") != "decision":
+                    it["status"] = "ready"       # re-open for the orchestrator once the ruling lands
+            BACKLOG.write_text("# Factory backlog — the orchestrator's work queue.\n"
+                               + yaml.safe_dump(bl, sort_keys=False))
+    return {"ok": True, "decision": dec}
 
 
 # ----------------------------------------------------------------------------- shaping
@@ -29,12 +142,15 @@ def structure_run(run: dict) -> dict:
     """Group the flat event stream into an ordered timeline of phases, gates and markers."""
     tl = []
     cur = None
+    seq = {}
     for e in run["events"]:
         ev = e["event"]
         detail = json.loads(e["detail"]) if e.get("detail") else {}
         if ev == "phase_start":
-            cur = {"type": "phase", "name": e["phase"], "kind": e["kind"], "owner": e["owner"],
-                   "ts": e["ts"], "items": [], "status": "running"}
+            nm = e["phase"]
+            k = seq.get(nm, 0); seq[nm] = k + 1        # per-role instance index → maps to its session file
+            cur = {"type": "phase", "name": nm, "kind": e["kind"], "owner": e["owner"],
+                   "ts": e["ts"], "items": [], "status": "running", "seq": k}
             tl.append(cur)
         elif ev == "phase_end":
             if cur and cur["name"] == e["phase"]:
@@ -89,6 +205,16 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"runs": obsdb.list_runs(conn)})
                 finally:
                     conn.close()
+            if path == "/api/decisions":
+                data = load_decisions()
+                pending = [d for d in data["decisions"] if d.get("status") == "pending"]
+                return self._json({"decisions": data["decisions"], "pending": len(pending)})
+            if path.startswith("/api/runs/") and path.endswith("/phase"):
+                rid = path[len("/api/runs/"):-len("/phase")]
+                q = parse_qs(urlparse(self.path).query)
+                role = q.get("role", [""])[0]; seq = int(q.get("seq", ["0"])[0])
+                st = phase_stream(rid, role, seq)
+                return self._json(st) if st else self._json({"error": "no stream"}, 404)
             if path.startswith("/api/runs/"):
                 rid = path[len("/api/runs/"):]
                 conn = obsdb.connect()
@@ -97,6 +223,19 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(structure_run(run)) if run else self._json({"error": "not found"}, 404)
                 finally:
                     conn.close()
+            return self._send(404, "not found", "text/plain")
+        except Exception as ex:
+            return self._json({"error": str(ex)}, 500)
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length) or b"{}")
+            if path.startswith("/api/decisions/"):
+                did = path[len("/api/decisions/"):]
+                res = record_decision(did, body.get("action", ""), body.get("note", ""))
+                return self._json(res, 200 if res.get("ok") else 400)
             return self._send(404, "not found", "text/plain")
         except Exception as ex:
             return self._json({"error": str(ex)}, 500)
@@ -215,16 +354,56 @@ display:flex;align-items:center;gap:10px;margin:6px 0 2px}
 .gicon.ok{background:var(--pass)}.gicon.no{background:var(--fail)}
 .farrow{flex:none;align-self:center;color:var(--mute);padding:0 4px;font-size:13px}
 .to-badge{position:absolute;bottom:6px;right:9px;font-family:var(--mono);font-size:8.5px;color:var(--wait)}
+.nav{display:flex;gap:4px;margin-left:6px}
+.nav button{font-family:var(--mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;padding:5px 12px;border:1px solid var(--brd);background:var(--surf);color:var(--dim);border-radius:3px;cursor:pointer}
+.nav button.on{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
+.nav .badge{background:var(--bad);color:#fff;border-radius:9px;padding:0 6px;font-size:10px;margin-left:6px}
+.fnode.agent,.phase .ph{cursor:pointer}
+.fnode.agent:hover{border-color:var(--accent)}
+.drawer{position:fixed;inset:0;background:color-mix(in srgb,#000 55%,transparent);z-index:20;display:flex;justify-content:flex-end}
+.drawer-inner{width:min(680px,94vw);height:100%;background:var(--bg);border-left:1px solid var(--brd);overflow-y:auto;padding:20px 22px}
+.drawer h3{margin:0 0 3px;font-size:17px}
+.drawer .dh{display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--brd);padding-bottom:12px;margin-bottom:14px}
+.drawer .x{margin-left:auto;background:var(--surf);border:1px solid var(--brd);color:var(--txt);border-radius:4px;cursor:pointer;font-size:16px;width:30px;height:30px}
+.act{display:flex;gap:10px;padding:8px 0;border-bottom:1px solid var(--brd);font-size:12.5px}
+.act .tag{font-family:var(--mono);font-size:9px;letter-spacing:.08em;text-transform:uppercase;padding:2px 6px;border-radius:2px;height:fit-content;flex:none}
+.act.say .tag{background:color-mix(in srgb,var(--info) 22%,transparent);color:var(--txt)}
+.act.tool .tag{background:color-mix(in srgb,var(--accent) 20%,transparent);color:var(--txt)}
+.act.tool.err .tag{background:color-mix(in srgb,var(--bad) 24%,transparent)}
+.act .body{color:var(--txt-dim);white-space:pre-wrap;word-break:break-word;min-width:0}
+.act .nm{font-family:var(--mono);color:var(--txt);font-size:12px}
+.act .res{font-family:var(--mono);font-size:11px;color:var(--txt-mute);margin-top:3px}
+.env{margin-top:14px;padding:12px;border:1px solid var(--accent);border-radius:5px;background:var(--surf);font-family:var(--mono);font-size:11.5px;white-space:pre-wrap;word-break:break-word}
+.env .lbl{color:var(--accent);text-transform:uppercase;letter-spacing:.08em;font-size:10px;margin-bottom:6px;display:block}
+.decisions{padding:22px clamp(16px,3vw,30px);overflow-y:auto;max-width:900px}
+.dcard{border:1px solid var(--brd);border-radius:6px;background:var(--surfc,var(--surf));margin-bottom:16px;overflow:hidden}
+.dcard.kind-fix{border-top:3px solid var(--bad)} .dcard.kind-launch-gate{border-top:3px solid var(--info)} .dcard.kind-ratify{border-top:3px solid var(--accent)}
+.dcard.resolved{opacity:.55}
+.dcard .dt{padding:14px 18px 8px}
+.dcard .dt h3{margin:0;font-size:16px}
+.dcard .kchip{font-family:var(--mono);font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--txt-mute)}
+.dsec{padding:6px 18px}
+.dsec .l{font-family:var(--mono);font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--txt-mute);margin-bottom:3px}
+.dsec.copilot{background:color-mix(in srgb,var(--accent) 7%,transparent);border-left:2px solid var(--accent);margin:8px 0}
+.dsec.copilot .l{color:var(--accent)}
+.dsec p{margin:0 0 8px;font-size:13.5px;color:var(--txt-dim)}
+.dacts{display:flex;gap:8px;flex-wrap:wrap;padding:12px 18px 16px;border-top:1px solid var(--brd);align-items:center}
+.dbtn{font-family:var(--mono);font-size:12px;padding:7px 14px;border-radius:4px;border:1px solid var(--brd);cursor:pointer;background:var(--surf);color:var(--txt)}
+.dbtn.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
+.dstatus{font-family:var(--mono);font-size:11px;color:var(--good);margin-left:auto}
 </style></head><body>
 <header>
   <span class="brand">Factory · Observatory</span>
+  <span class="nav" id="nav"></span>
   <span class="sub" id="count">—</span>
   <span class="live"><span class="pulse"></span> live · polling 2s</span>
 </header>
-<div class="layout">
+<div class="layout" id="runsview">
   <div class="list" id="list"></div>
-  <div class="detail" id="detail"><div class="empty">Select a run to inspect its pipeline.</div></div>
+  <div class="detail" id="detail"><div class="empty">Select a run to inspect its pipeline — then click any agent phase to drill in.</div></div>
 </div>
+<div class="decisions" id="decisionsview" style="display:none"></div>
+<div id="drawer"></div>
 <script>
 const $=(s,r=document)=>r.querySelector(s), el=(t,c,h)=>{const n=document.createElement(t);if(c)n.className=c;if(h!=null)n.innerHTML=h;return n};
 let sel=null, runs=[];
@@ -258,6 +437,7 @@ function phaseCard(p){
   head.append(el("span","badge "+(p.kind==="agent"?"b-agent":"b-code"),p.kind),
               el("span","nm",p.name), el("span","own",p.owner||""));
   const dot=el("span","sdot "+(p.status==="success"?"d-ok":p.status==="running"?"d-run":"d-fail"));head.append(dot);
+  if(p.kind==="agent")head.onclick=()=>openDrill(p.name,p.seq,p.name);
   card.append(head);
   if(p.items&&p.items.length){const it=el("div","items");
     p.items.forEach(i=>{ if(i.kind==="gate")it.append(gchip(i)); else it.append(callRow(i)); });
@@ -300,7 +480,7 @@ function buildTracks(tlData){
     if(t.type==="iter"){cur={label:"fix "+t.i,nodes:[]};tracks.push(cur)}
     else if(t.type==="phase"){
       const call=(t.items||[]).find(i=>i.kind==="call");
-      P({c:t.kind==="agent"?"agent":"code",nt:t.kind,nn:t.name,
+      P({c:t.kind==="agent"?"agent":"code",nt:t.kind,nn:t.name,role:t.name,seq:t.seq,
          ns:call?("$"+(call.cost||0).toFixed(2)):(t.owner||""),st:t.status,to:call&&call.timed_out});
       (t.items||[]).filter(i=>i.kind==="gate").forEach(g=>P({c:"gate",nn:g.gate,passed:g.passed}));
     }
@@ -323,6 +503,7 @@ function fnode(n){
   if(n.ns)d.append(el("div","fns",n.ns));
   if(n.st)d.append(el("span","fst "+(n.st==="success"?"d-ok":n.st==="running"?"d-run":"d-fail")));
   if(n.to)d.append(el("div","to-badge","↻ resumed"));
+  if(n.c==="agent"&&n.role!=null)d.onclick=()=>openDrill(n.role,n.seq,n.nn);
   return d;
 }
 function renderFlow(tlData){
@@ -338,6 +519,7 @@ function renderFlow(tlData){
   return wrap;
 }
 function loadDetail(id){
+  curRunId=id;
   fetch("/api/runs/"+id).then(r=>r.json()).then(run=>{
     if(sel!==id)return;
     const d=$("#detail");d.innerHTML="";
@@ -354,8 +536,76 @@ function loadDetail(id){
     d.append(view==="flow"?renderFlow(run.timeline):renderTimeline(run.timeline));
   });
 }
-function poll(){fetch("/api/runs").then(r=>r.json()).then(d=>{runs=d.runs||[];renderList();if(sel)loadDetail(sel)}).catch(()=>{})}
-poll();setInterval(poll,2000);
+let curRunId=null, mode="runs", pending=0;
+// -- drill-down drawer: what an agent actually said and did in one phase --
+function openDrill(role,seq,label){
+  if(!curRunId)return;
+  fetch("/api/runs/"+curRunId+"/phase?role="+encodeURIComponent(role)+"&seq="+seq).then(r=>r.json()).then(st=>{
+    const wrap=el("div","drawer");wrap.onclick=e=>{if(e.target===wrap)wrap.remove()};
+    const inner=el("div","drawer-inner");
+    const dh=el("div","dh");
+    dh.append(el("span","badge b-agent","agent"), el("h3",null,label),
+              el("span","fns","· "+(st.tools||0)+" tool calls · $"+(st.cost||0).toFixed(2)));
+    const x=el("button","x","×");x.onclick=()=>wrap.remove();dh.append(x);
+    inner.append(dh);
+    if(st.prompt){const pr=el("div","env");pr.append(el("span","lbl","prompt given"));pr.append(document.createTextNode(st.prompt));pr.style.borderColor="var(--brd)";inner.append(pr)}
+    (st.activity||[]).forEach(a=>{
+      const row=el("div","act "+a.kind+(a.error?" err":""));
+      if(a.kind==="tool"){row.append(el("span","tag",a.name||"tool"));
+        const b=el("div","body");b.append(el("div","nm",a.args||""));
+        if(a.result)b.append(el("div","res",a.result));row.append(b);}
+      else {row.append(el("span","tag","says"), el("div","body",a.text||""));}
+      inner.append(row);
+    });
+    if(st.envelope){const e=el("div","env");e.append(el("span","lbl","envelope returned"));e.append(document.createTextNode(st.envelope));inner.append(e);}
+    if(!(st.activity||[]).length && !st.envelope)inner.append(el("div","empty","No stream recorded for this phase instance."));
+    wrap.append(inner);$("#drawer").innerHTML="";$("#drawer").append(wrap);
+  });
+}
+// -- decisions view: escalations + ratifications, with copilot analysis + approve controls --
+function renderDecisions(list){
+  const box=$("#decisionsview");box.innerHTML="";
+  box.append(el("h2",null,"Decisions — your rulings, with copilot analysis"));
+  if(!list.length){box.append(el("div","empty","No decisions pending. The line is clear."));return}
+  list.forEach(d=>{
+    const c=el("div","dcard kind-"+d.kind+(d.status!=="pending"?" resolved":""));
+    const dt=el("div","dt");dt.append(el("div","kchip",d.kind+(d.run_id?(" · "+d.run_id):"")), el("h3",null,d.title));c.append(dt);
+    const sec=(l,t,cls)=>{const s=el("div","dsec "+(cls||""));s.append(el("div","l",l));s.append(el("p",null,t));return s};
+    if(d.finding)c.append(sec("Finding",d.finding));
+    if(d.analysis)c.append(sec("Copilot analysis",d.analysis,"copilot"));
+    if(d.recommendation)c.append(sec("Recommendation",d.recommendation,"copilot"));
+    const acts=el("div","dacts");
+    if(d.status==="pending"){
+      (d.options||["Approve","Reject"]).forEach((opt,i)=>{
+        const b=el("button","dbtn"+(i===0?" primary":""),opt);
+        b.onclick=()=>{const note=prompt("Optional note for: "+opt)||"";
+          fetch("/api/decisions/"+d.id,{method:"POST",headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({action:opt,note})}).then(()=>pollDecisions())};
+        acts.append(b);
+      });
+    } else {acts.append(el("span","dstatus","✓ "+(d.human_action||d.status)+(d.human_note?(" — "+d.human_note):"")))}
+    c.append(acts);box.append(c);
+  });
+}
+function pollDecisions(){return fetch("/api/decisions").then(r=>r.json()).then(d=>{
+  pending=d.pending||0; renderNav();
+  if(mode==="decisions")renderDecisions(d.decisions||[]);
+}).catch(()=>{})}
+function renderNav(){
+  const n=$("#nav");n.innerHTML="";
+  [["runs","Runs"],["decisions","Decisions"]].forEach(([m,lbl])=>{
+    const b=el("button",mode===m?"on":null);b.append(document.createTextNode(lbl));
+    if(m==="decisions"&&pending)b.append(el("span","badge",String(pending)));
+    b.onclick=()=>{mode=m;switchMode()};n.append(b);
+  });
+}
+function switchMode(){
+  $("#runsview").style.display = mode==="runs"?"grid":"none";
+  $("#decisionsview").style.display = mode==="decisions"?"block":"none";
+  renderNav(); if(mode==="decisions")pollDecisions();
+}
+function poll(){fetch("/api/runs").then(r=>r.json()).then(d=>{runs=d.runs||[];renderList();if(sel&&mode==="runs")loadDetail(sel)}).catch(()=>{})}
+renderNav();poll();pollDecisions();setInterval(()=>{poll();pollDecisions()},2000);
 </script></body></html>"""
 
 
