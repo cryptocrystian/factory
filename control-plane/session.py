@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import config
+import isolation
 import envelopes as E
 from tracer import Tracer
 
@@ -19,8 +20,9 @@ class GitError(RuntimeError):
 
 
 class Run:
-    def __init__(self, workspace: Path, lane: str, target: str, run_id: str | None = None):
-        self.workspace = Path(workspace).resolve()
+    def __init__(self, workspace: Path, lane: str, target: str, run_id: str | None = None,
+                 isolation_port=None):
+        self.origin = Path(workspace).resolve()                 # the real repo — never mutated by a run
         self.lane = lane
         self.target = target
         self.run_id = run_id or f"{time.strftime('%Y-%m-%d-%H%M%S')}-{lane}-{target}"
@@ -28,14 +30,15 @@ class Run:
         self.dir.mkdir(parents=True, exist_ok=True)
         self.tracer = Tracer(self.dir, self.run_id, lane=lane, target=target)
         self.accepted: bool | None = None
-        self._base = self.git("rev-parse", "HEAD").strip()      # pin the base (I4-ish, local)
-        # Isolation: run on a branch; only merge to the base when accepted (gated merge, Rev4 P5).
-        self.base_branch = self.git("rev-parse", "--abbrev-ref", "HEAD").strip()
-        self.work_branch = f"factory/{self.run_id}"
-        if self.dirty():
-            raise GitError("workspace is dirty; a run must start from a clean tree (I4)")
-        self.git("checkout", "-q", "-b", self.work_branch)
-        self.tracer.log(event_detail="run_start", workspace=str(self.workspace),
+        # Isolation port: acquire an isolated worktree; the run mutates only there and merges back to the
+        # base only when accepted (gated merge, Rev4 P5). The origin repo's working tree is never touched.
+        self._iso_port = isolation_port or isolation.default_isolation()
+        self._iso = self._iso_port.acquire(self.origin, self.run_id)
+        self.workspace = self._iso.path                         # where the run (and its agents) operate
+        self._base = self._iso.base_commit
+        self.base_branch = self._iso.base_branch
+        self.work_branch = self._iso.branch
+        self.tracer.log(event_detail="run_start", origin=str(self.origin), workspace=str(self.workspace),
                         base=self._base[:8], base_branch=self.base_branch, work_branch=self.work_branch)
 
     # ---- git in the workspace ------------------------------------------------
@@ -82,22 +85,23 @@ class Run:
             self.tracer.phase_end(params.name, status)
 
     def finish(self, accepted: bool, reason: str = "") -> bool:
+        """Gated merge via the Isolation port. Honesty invariant: the returned value is the TRUE
+        outcome — an accepted run only returns True if the work actually merged onto the base. An
+        accepted run that can't merge (residual work, a conflict, or the base advanced under us: I11)
+        is downgraded to a non-success with a reason, so the orchestrator escalates instead of
+        believing the base advanced. The worktree is destroyed; its branch is kept for inspection on
+        any non-success."""
         self.accepted = accepted
-        # Gated merge: accepted -> merge the work branch into the base; else -> leave the base
-        # untouched (return the tree to base; the work branch remains for inspection).
-        merged = False
-        try:
-            if not self.dirty():
-                self.git("checkout", "-q", self.base_branch)
-                if accepted:
-                    self.git("-c", "commit.gpgsign=false", "merge", "--no-ff", "-q",
-                             "-m", f"merge {self.work_branch} (accepted)", self.work_branch)
-                    merged = True
-        except GitError as e:
-            self.tracer.log(event_detail="merge_error", error=str(e))
-        self.tracer.log(event_detail="finish", accepted=accepted, reason=reason, merged=merged,
-                        work_branch=self.work_branch, cost_usd=self.tracer.total_cost())
-        return accepted
+        res = self._iso.merge_back(accepted)
+        if res.error:
+            self.tracer.log(event_detail="merge_error", error=res.error)
+        result = accepted and res.merged
+        if accepted and not res.merged:
+            reason = ((reason + " | ") if reason else "") + (res.error or "accepted but merge did not complete")
+        self.tracer.log(event_detail="finish", accepted=accepted, merged=res.merged, result=result,
+                        reason=reason, work_branch=self.work_branch, cost_usd=self.tracer.total_cost())
+        self._iso.destroy(keep_branch=not result)
+        return result
 
 
 class _Phase:

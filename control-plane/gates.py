@@ -3,6 +3,8 @@ not just that it passed. Gate failures return to the same OMP session as correct
 (bounded by retries); a permission breach is different — that aborts (permissions.py)."""
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
 from pathlib import Path
 
@@ -35,14 +37,19 @@ def diff_matches_claims(env: EnvelopeBase, run) -> GateReport:
     """Every file the agent claims it changed actually differs on disk (tracked or untracked)."""
     claimed = getattr(env, "changed_files", []) or []
     changed = {c[3:] for c in run.git("status", "--porcelain=v1", "-z").split("\0") if len(c) > 3}
-    committed = set()
-    checks = []
-    for f in claimed:
-        on_disk = (run.workspace / f).exists()
-        checks.append({"item": f, "ok": on_disk, "note": "present" if on_disk else "claimed but absent"})
+    base = getattr(run, "_base", None)
+    if base:                                    # include changes already committed this run (phase commits)
+        try:
+            for f in run.git("diff", "--name-only", base, "HEAD").splitlines():
+                if f.strip():
+                    changed.add(f.strip())
+        except Exception:
+            pass
+    checks = [{"item": f, "ok": f in changed,
+               "note": "changed" if f in changed else "claimed but unchanged"} for f in claimed]
     passed = all(c["ok"] for c in checks) if checks else True
     return GateReport(gate="diff_matches_claims", passed=passed, checks=checks,
-                      evidence=f"{len(claimed)} files claimed")
+                      evidence=f"{sum(c['ok'] for c in checks)}/{len(claimed)} claimed files actually changed")
 
 
 def verdict_consistent(env, run) -> GateReport:
@@ -62,14 +69,27 @@ def verdict_consistent(env, run) -> GateReport:
 
 
 def cmd_gate(name: str, command: str):
-    """Factory: a known command that must exit 0 (typecheck, check:tokens, test:unit, next build)."""
+    """Factory: a known command that must exit 0 (typecheck, check:tokens, test:unit, next build).
+    Runs in its own session so a hung/backgrounding command's whole process tree is reaped on timeout."""
     def _gate(env, run) -> GateReport:
-        p = subprocess.run(command, shell=True, cwd=str(run.workspace),
-                           capture_output=True, text=True, timeout=600)
-        tail = (p.stdout + p.stderr)[-1000:]
-        return GateReport(gate=name, passed=p.returncode == 0,
-                          checks=[{"item": command, "ok": p.returncode == 0}],
-                          evidence=tail if p.returncode != 0 else f"{name} exit 0")
+        proc = subprocess.Popen(command, shell=True, cwd=str(run.workspace),
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, start_new_session=True)
+        try:
+            out, _ = proc.communicate(timeout=600)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                proc.kill()
+            proc.wait(timeout=10)
+            return GateReport(gate=name, passed=False,
+                              checks=[{"item": command, "ok": False}],
+                              evidence=f"{name} timed out after 600s (process tree killed)")
+        tail = (out or "")[-1000:]
+        return GateReport(gate=name, passed=proc.returncode == 0,
+                          checks=[{"item": command, "ok": proc.returncode == 0}],
+                          evidence=tail if proc.returncode != 0 else f"{name} exit 0")
     return _gate
 
 

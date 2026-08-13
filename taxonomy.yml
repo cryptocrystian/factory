@@ -1,0 +1,47 @@
+# taxonomy.yml — machine-readable derivation of canon/buildops-canon.md (the human source of truth).
+# The channel provisioner (provision.py) and the Notifier consume THIS. Edit the canon first, then
+# reflect changes here. Automation routes on the registry this produces, never by parsing names (B11).
+
+# Phases — Initiative-level milestones (order = the sequence of synchronization gates).
+phases: [explore, shape, build, launch, grow]
+
+# Tracks — concurrent workstreams (B6: instantiate lazily). Each realizes as a channel <initiative>-<suffix>.
+#   default: provisioned for every new Initiative.   in_home: folded into the home channel by default.
+#   on_demand: created only when that work + those people are real.
+tracks:
+  strategy:  { suffix: strategy,  in_home: true }                 # lives in the home channel by default
+  product:   { suffix: product,   default: true }                 # the factory's track
+  gtm:       { suffix: gtm,        on_demand: true }
+  marketing: { suffix: marketing,  on_demand: true }
+  sales:     { suffix: sales,      on_demand: true }
+  ops:       { suffix: ops,        on_demand: true }
+
+# The default provisioning set for a new Initiative (lazy instantiation, B6): home + product only.
+initiative_defaults:
+  channels:
+    - { key: home,    suffix: "" }             # <initiative>
+    - { key: product, suffix: product }        # <initiative>-product
+  visibility: open                             # internal; client Initiatives override to private (B4)
+
+# Escalation routing: which facet the factory's build escalations/acceptances post to, per Initiative.
+escalation_facet: product
+
+# Workspace-level channels (tenant-wide, not per-Initiative).
+workspace_channels: [announcements, ops, escalations]
+
+# Members enrolled (admin) in every provisioned channel, by npub-hex. The copilot/operator
+# (cb04d4f3…) is the channel creator and already a member, so it need not be listed.
+members:
+  - 86fd81bbb59bc501a78435677255adab7961ae57329ae7446741bbd44f92af81   # ChristianD (owner)
+
+# Agent personas (aspirational until the ACP copilot + templates land). Copilot is cross-cutting.
+personas:
+  copilot:    { label: "Copilot",    scope: all,               harness: buzz-acp }
+  product-pm: { label: "Product/PM", scope: [product, home] }
+  builder:    { label: "Builder",    scope: [product] }
+  reviewer:   { label: "Reviewer",   scope: [product] }
+  strategy:   { label: "Strategy",   scope: [home] }
+  gtm:        { label: "GTM",         scope: [gtm] }
+  marketing:  { label: "Marketing",  scope: [marketing] }
+  sales:      { label: "Sales",       scope: [sales] }
+  ops:        { label: "Ops",         scope: [ops] }

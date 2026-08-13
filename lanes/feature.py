@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -31,12 +32,20 @@ from session import Run
 
 # ----------------------------------------------------------------------------- runners
 class LiveRunner:
-    """Drive OMP; on a mid-build timeout, resume the same session (bounded)."""
+    """Drive OMP; on a mid-phase timeout, resume the same session — bounded by BOTH a retry count and a
+    per-phase wall-clock cap (I9), so a phase that can't converge escalates instead of churning."""
     def run(self, call: E.AgentCall, run: Run, workspace: Path):
+        budget = config.Budget()
+        start = time.monotonic()
         res = omp.run(call, run.dir, workspace, run.tracer)
         tries = 0
-        while (res.timed_out or not res.ok) and tries < config.Budget().max_retries_per_phase + 2:
+        while (res.timed_out or not res.ok) and tries < budget.max_retries_per_phase:
             if not res.session_id:
+                break
+            elapsed = time.monotonic() - start
+            if elapsed > budget.max_wall_s:                 # per-phase wall cap: give up, let the lane escalate
+                run.tracer.log(event_detail="phase_wall_exceeded", role=call.role,
+                               elapsed_s=int(elapsed), max_wall_s=budget.max_wall_s)
                 break
             call = replace_call(call, resume_session=res.session_id)
             res = omp.run(call, run.dir, workspace, run.tracer)
@@ -75,9 +84,11 @@ class Lane:
         self.runner = runner
         self.live = live
         self.design = config.design_policy(self.repo)   # None unless the repo opts into the anti-slop gate
+        self._agent_gates_ok = True   # agent-phase gates enforce on live runs (reset per pass/fix-iter)
 
     def run(self) -> bool:
         run = Run(self.repo, lane="feature", target=self.journey)
+        self._agent_gates_ok = True
         run.tracer.log(event_detail="lane_start", journey=self.journey, mode="live" if self.live else "replay")
 
         # -- resolve (I7: canon gap halts) ------------------------------------
@@ -106,7 +117,7 @@ class Lane:
 
         # -- review (different family; read-only) + verdict gate ---------------
         approved, findings, review = self._review(run)
-        accepted = l0_ok and unit_ok[0] and approved
+        accepted = l0_ok and unit_ok[0] and approved and self._agent_gates_ok
         if not accepted:
             accepted = self._converge(run, findings, unit_ok[1])
         return run.finish(accepted, reason="" if accepted else "did not converge")
@@ -123,6 +134,7 @@ class Lane:
         """Build a foundation (auth, infra…) from a brief instead of a canon journey — same machinery.
         The brief IS the context/spec; the planner turns it into a plan, then build→verify→review→converge."""
         run = Run(self.repo, lane="foundation", target=self.journey)
+        self._agent_gates_ok = True
         run.tracer.log(event_detail="foundation_start", target=self.journey)
         (run.dir / "context.md").write_text(brief)
         plan = self._agent(run, "planner", "plan",
@@ -135,7 +147,7 @@ class Lane:
         l0_ok = self._build(run, plan)
         unit_ok = self._test(run)
         approved, findings, _ = self._review(run)
-        accepted = l0_ok and unit_ok[0] and approved
+        accepted = l0_ok and unit_ok[0] and approved and self._agent_gates_ok
         if not accepted:
             accepted = self._converge(run, findings, unit_ok[1])
         return run.finish(accepted, reason="" if accepted else "did not converge")
@@ -151,8 +163,9 @@ class Lane:
             if not res.ok:
                 run.tracer.log(event_detail="agent_no_envelope", role=role, error=res.error)
                 return None
-            # write-enforcement against the repo (planner writes to run dir, so enforce only repo roles)
-            if cwd == self.repo:
+            # write-enforcement against the isolated worktree (planner writes to run dir, not the
+            # workspace, so enforce only for roles that operate in the worktree)
+            if cwd == run.workspace:
                 pr = perm.enforce(run, role)
                 if not pr.ok:
                     run.tracer.log(event_detail="phase_aborted_breach", role=role)
@@ -162,7 +175,11 @@ class Lane:
                 run.tracer.gate(rep)
                 if not rep.passed:
                     run.tracer.log(event_detail="gate_failed", role=role, gate=rep.gate)
-                    # (bounded correction loop would resume here; recorded here as a finding)
+                    # Live runs ENFORCE: a failed agent-phase gate blocks acceptance and routes to
+                    # the bounded fix loop. Replay feeds recorded envelopes without re-applying diffs,
+                    # so diff/artifact gates can't be satisfied there — advisory in replay by design.
+                    if self.live:
+                        self._agent_gates_ok = False
             if commit_msg:
                 run.commit(getattr(res.envelope, "commit_message", None) or commit_msg)
             ph.ok()
@@ -171,7 +188,7 @@ class Lane:
     def _build(self, run, plan) -> bool:
         env = self._agent(run, "builder", "build",
                          prompt=self._builder_prompt(run, plan),
-                         cwd=self.repo, add_dirs=[run.dir],
+                         cwd=run.workspace, add_dirs=[run.dir],
                          gate_fns=[gates.diff_matches_claims])
         if env is None:
             return False
@@ -201,7 +218,7 @@ class Lane:
     def _test(self, run, prompt=None) -> tuple[bool, str]:
         self._agent(run, "test-author", "test",
                     prompt=prompt or self._test_prompt(run),
-                    cwd=self.repo, add_dirs=[run.dir], gate_fns=[])
+                    cwd=run.workspace, add_dirs=[run.dir], gate_fns=[])
         rep = gates.cmd_gate("test:unit", "npm run test:unit")(None, run)
         run.tracer.gate(rep)
         run.commit(f"test: {self.journey} acceptance tests")
@@ -210,7 +227,7 @@ class Lane:
     def _review(self, run):
         review = self._agent(run, "reviewer", "review",
                            prompt=self._reviewer_prompt(run),
-                           cwd=self.repo, add_dirs=[run.dir],
+                           cwd=run.workspace, add_dirs=[run.dir],
                            gate_fns=[gates.verdict_consistent])
         approved = bool(getattr(review, "approved", False)) if review else False
         blocking = getattr(review, "blocking", []) if review else ["no review envelope"]
@@ -221,6 +238,7 @@ class Lane:
         """Bounded fix loop: re-route findings + failing-gate output to the builder until accepted."""
         for i in range(1, MAX_FIX_ITERS + 1):
             run.tracer.log(event_detail="fix_iter", i=i, findings=findings)
+            self._agent_gates_ok = True        # this iteration's builder/reviewer gates must pass
             fixmd = "# Findings to close\n\n" + "\n".join(f"- {f}" for f in findings)
             if unit_evidence:
                 fixmd += f"\n\n## Failing unit output\n```\n{unit_evidence[-1500:]}\n```"
@@ -230,7 +248,7 @@ class Lane:
                                      "Read context.md for governing canon. Self-verify "
                                      "gen:tokens/check:tokens/typecheck." + self._design_selfcheck()
                                      + " Return your envelope."),
-                             cwd=self.repo, add_dirs=[run.dir], gate_fns=[gates.diff_matches_claims])
+                             cwd=run.workspace, add_dirs=[run.dir], gate_fns=[gates.diff_matches_claims])
             l0 = True
             for g in self._l0_gates():
                 rep = g(None, run); run.tracer.gate(rep); l0 = l0 and rep.passed
@@ -240,7 +258,7 @@ class Lane:
                              f"in findings-{i}.md. Run npm run test:unit; leave a real defect failing and "
                              "name it. Tests only. Return your envelope."))
             approved, findings, _ = self._review(run)
-            if l0 and unit_ok and approved:
+            if l0 and unit_ok and approved and self._agent_gates_ok:
                 run.tracer.log(event_detail="converged", iter=i)
                 return True
         run.tracer.log(event_detail="not_converged", iters=MAX_FIX_ITERS)

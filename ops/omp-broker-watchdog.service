@@ -1,0 +1,13 @@
+[Unit]
+Description=Auth-broker health watchdog (alerts Buzz on credential failure)
+After=omp-auth-broker.service
+
+[Service]
+Type=oneshot
+User=root
+Environment=TERM=dumb
+Environment=HOME=/root
+Environment=FACTORY_DIR=/root/factory
+# Installed to a stable path (not the factory tree, which may lag behind git). Only buzz.py is
+# read from FACTORY_DIR/control-plane, and that file is kept current on the box.
+ExecStart=/usr/bin/env bash /usr/local/bin/omp-broker-watchdog

@@ -11,6 +11,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import config, permissions as perm, gates
 import envelopes as E
+config.RUNS_DIR = Path(tempfile.mkdtemp())        # isolate worktrees/run dirs from the real factory
 from session import Run
 
 ok = True
@@ -40,26 +41,30 @@ with tempfile.TemporaryDirectory() as td:
     subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "base"], cwd=repo)
 
     run = Run(repo, lane="selftest", target="k2", run_id="selftest-k2")
+    ws = Path(run.workspace)                        # the run operates in the isolated worktree
+    (ws / "tests").mkdir(exist_ok=True)             # empty dirs aren't committed, so ensure it exists
 
-    # test-author illegally edits source + legally adds a test
-    (repo / "lib" / "compute.ts").write_text("export const v = 999; // tampered\n")
-    (repo / "tests" / "a.spec.ts").write_text("test('x', () => {})\n")
+    # test-author illegally edits source + legally adds a test (in the worktree)
+    (ws / "lib" / "compute.ts").write_text("export const v = 999; // tampered\n")
+    (ws / "tests" / "a.spec.ts").write_text("test('x', () => {})\n")
     res = perm.enforce(run, "test-author")
     check("breach detected", not res.ok, f"breaches={res.breaches}")
-    check("source change rolled back", (repo / "lib" / "compute.ts").read_text().strip() == "export const v = 1;")
-    check("legal test file kept", (repo / "tests" / "a.spec.ts").exists())
+    check("source change rolled back", (ws / "lib" / "compute.ts").read_text().strip() == "export const v = 1;")
+    check("legal test file kept", (ws / "tests" / "a.spec.ts").exists())
 
     # builder writing source is allowed (no breach)
-    (repo / "lib" / "compute.ts").write_text("export const v = 2;\n")
+    (ws / "lib" / "compute.ts").write_text("export const v = 2;\n")
     res2 = perm.enforce(run, "builder")
-    check("builder source write allowed", res2.ok and (repo / "lib" / "compute.ts").read_text().strip().endswith("v = 2;"))
+    check("builder source write allowed", res2.ok and (ws / "lib" / "compute.ts").read_text().strip().endswith("v = 2;"))
 
-    # ---- cmd_gate ----
+    # ---- cmd_gate (runs in the worktree) ----
     print("cmd_gate:")
     gp = gates.cmd_gate("true-gate", "true")(None, run)
     check("passing command -> passed", gp.passed)
     gf = gates.cmd_gate("false-gate", "false")(None, run)
     check("failing command -> not passed", not gf.passed)
+
+    run._iso.destroy(keep_branch=False)            # clean up the worktree
 
 # ---- verdict_consistent (pure) ----
 print("verdict_consistent:")

@@ -1,0 +1,25 @@
+[Unit]
+Description=OMP auth-broker — single-holder credential vault for the factory
+Documentation=https://github.com/cryptocrystian/factory
+After=network-online.target
+Wants=network-online.target
+# Never stop trying to restart it; this process is the sole refresher of the
+# Anthropic/Codex OAuth. If it dies, no worker can borrow auth.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Environment=TERM=dumb
+Environment=HOME=/root
+# Bound to localhost. Remote workers reach it via Traefik (added separately),
+# never by binding the broker itself to a public interface.
+ExecStart=/usr/local/bin/omp auth-broker serve --bind=127.0.0.1:9099
+Restart=always
+RestartSec=5
+# The broker holds live OAuth in memory; give it a clean SIGTERM stop.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

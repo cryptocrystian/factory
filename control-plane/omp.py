@@ -10,12 +10,27 @@ Everything here is the verified adapter contract from FACTORY-HARNESS-SPEC.md:
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import config
 import envelopes as E
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Reap the entire process group, not just the direct child — a timed-out phase must not leave
+    orphaned OMP/tool children alive to keep touching the workspace after the phase 'ended' (the
+    root cause of the prior run interruption). Relies on start_new_session=True at spawn."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 
 @dataclass
@@ -83,6 +98,51 @@ def _parse_stream(lines: list[str]):
     return session_id, final_text, max_cost, n
 
 
+# Where a host advertises the auth-broker to borrow OAuth from. A broker-env file holds
+# OMP_AUTH_BROKER_URL + OMP_AUTH_BROKER_TOKEN; loading it makes every omp child a *borrower*
+# that never refreshes the raw OAuth itself. This is the single-refresher discipline: the broker
+# service is the ONLY process that holds and rotates the credential, so no two holders can race
+# and mutually invalidate each other (the failure mode that killed Anthropic auth on 2026-08-13).
+# Hosts without a broker file (e.g. a dev laptop with its own vault) are unaffected — nothing loads.
+def _broker_env_candidates() -> tuple[str, ...]:
+    # Resolved per call (not frozen at import) so an OMP_BROKER_ENV_FILE override is honored.
+    return (
+        os.environ.get("OMP_BROKER_ENV_FILE", ""),
+        str(Path.home() / ".omp" / "broker-client.env"),
+        "/root/.omp/broker-client.env",
+    )
+
+
+def _child_env() -> dict[str, str]:
+    """Env for spawned omp: inherit the parent, then ensure broker vars are present if a
+    broker-env file exists and the parent hasn't already set them. Fail-open: any read/stat error
+    (missing file, or a path we can't even stat as this user) leaves the environment untouched —
+    the child falls back to whatever local auth it has."""
+    env = dict(os.environ)
+    if env.get("OMP_AUTH_BROKER_URL"):
+        return env                                  # parent already points at a broker; respect it
+    for cand in _broker_env_candidates():
+        if not cand:
+            continue
+        try:
+            p = Path(cand)
+            if not p.is_file():                     # is_file()/stat can raise on a foreign /root
+                continue
+            text = p.read_text()
+        except OSError:
+            continue                                # unreadable/unstattable → try the next candidate
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            if k.startswith("OMP_AUTH_BROKER_"):
+                env.setdefault(k, v.strip())
+        break                                       # first readable candidate wins
+    return env
+
+
 def run(call: E.AgentCall, run_dir: Path, workspace: Path, tracer=None) -> AgentResult:
     """Invoke one bounded OMP phase. `workspace` is the repo the agent operates in (its cwd)."""
     r = config.role(call.role)
@@ -91,15 +151,20 @@ def run(call: E.AgentCall, run_dir: Path, workspace: Path, tracer=None) -> Agent
     argv = _argv(call, r, session_dir)
 
     timed_out = False
+    # Spawn in a new session so the whole process tree can be reaped on timeout (start_new_session).
+    proc = subprocess.Popen(
+        argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, cwd=str(workspace), start_new_session=True, env=_child_env(),
+    )
     try:
-        proc = subprocess.run(
-            argv, input=call.prompt, capture_output=True, text=True,
-            timeout=call.max_time_s, cwd=str(workspace),
-        )
-        out = proc.stdout
-    except subprocess.TimeoutExpired as te:
+        out, _ = proc.communicate(input=call.prompt, timeout=r.timeout_s)   # per-role budget (I9)
+    except subprocess.TimeoutExpired:
         timed_out = True
-        out = te.stdout.decode() if isinstance(te.stdout, bytes) else (te.stdout or "")
+        _kill_tree(proc)                       # kill the group, not just the child
+        try:
+            out, _ = proc.communicate(timeout=15)   # drain whatever was buffered before the kill
+        except Exception:
+            out = ""
 
     lines = out.splitlines()
     (run_dir / f"{call.role}.jsonl").write_text(out)

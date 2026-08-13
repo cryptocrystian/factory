@@ -17,3 +17,14 @@ __pycache__/
 .DS_Store
 .vscode/
 .idea/
+
+# Secrets — never commit key material (sovereign/agent keys, env creds)
+*.key
+*.nsec
+ops/owner.key
+ops/*.key
+**/secrets/
+*.env
+.env
+owner-import.txt
+.env*

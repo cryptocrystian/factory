@@ -29,6 +29,7 @@ ESC_DIR = FACTORY_ROOT / "runs" / "escalations"
 CP = FACTORY_ROOT / "control-plane"
 sys.path.insert(0, str(CP))
 import obsdb
+import notifier as notifier_mod
 
 DONE = {"accepted", "done"}
 LANE = str(FACTORY_ROOT / "lanes" / "feature.py")
@@ -137,6 +138,9 @@ def run_orchestrator(dry_run=False, once=False):
     items = data["items"]
     acted = []
     persist = not dry_run                        # a dry run never mutates the real backlog
+    # A dry run posts nothing externally; a real run routes lifecycle events through
+    # the Notifier port (Buzz by default; file-only if unconfigured/unreachable).
+    nt = notifier_mod.NullNotifier() if dry_run else notifier_mod.get_notifier()
     while True:
         rd = ready(items)
         if not rd:
@@ -150,12 +154,17 @@ def run_orchestrator(dry_run=False, once=False):
             item["status"] = "accepted"; item["run_id"] = run_id
             print(f"  ✓ accepted  {item['id']}  → unblocks dependents")
             acted.append((item["id"], "accepted", None))
+            nt.accepted(project=item.get("repo", "—"), item_id=item["id"],
+                        kind=item["kind"], note=item.get("note", ""), run_id=run_id)
         else:
             item["status"] = "escalated"; item["run_id"] = run_id
             if persist:
                 bundle = escalate(item, run_id, blocking)
                 print(f"  ⚑ escalated {item['id']}  → {bundle.relative_to(FACTORY_ROOT)}")
                 acted.append((item["id"], "escalated", str(bundle)))
+                nt.escalation(project=item.get("repo", "—"), item_id=item["id"],
+                              kind=item["kind"], note=item.get("note", ""),
+                              run_id=run_id, blocking=blocking)
             else:
                 print(f"  ⚑ escalated {item['id']}  (dry — no bundle written)")
                 acted.append((item["id"], "escalated", None))

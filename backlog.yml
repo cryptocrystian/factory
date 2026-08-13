@@ -1,39 +1,40 @@
-# Factory backlog — the orchestrator's work queue. Edit status to re-open an item.
-# status: ready | blocked | in_progress | accepted | escalated | awaiting_human | done
-# depends_on gates an item until its deps are accepted. decisions are yours; the factory never dispatches them.
+# Factory backlog — the orchestrator's work queue.
 items:
-  - id: auth-foundation
-    repo: arxus
-    kind: foundation
-    brief: briefs/auth-foundation.md
-    status: ready
-    dry_outcome: accepted        # used only by --dry-run
-    note: production-ready AuthProvider (Supabase Auth) behind the seam — closes OPEN-S3-2
-
-  - id: jrn-s2
-    repo: arxus
-    kind: journey
-    journey: JRN-S2
-    depends_on: [auth-foundation]
-    status: blocked
-    dry_outcome: escalated
-    note: published seller with a live listing (needs an authenticated seller)
-
-  - id: jrn-b3
-    repo: arxus
-    kind: journey
-    journey: JRN-B3
-    depends_on: [auth-foundation]
-    status: blocked
-    dry_outcome: accepted
-    note: NDA -> tiered document access (needs an authenticated buyer)
-
-  - id: ratify-rubric
-    kind: decision
-    status: awaiting_human
-    note: OPEN-S3-1 — ratify the readiness rubric before production (launch gate)
-
-  - id: ratify-benchmarks
-    kind: decision
-    status: awaiting_human
-    note: OPEN-VAL1 — ratify the valuation benchmark table before production (launch gate)
+- id: auth-foundation
+  repo: arxus
+  kind: foundation
+  brief: briefs/auth-foundation.md
+  status: accepted
+  dry_outcome: accepted
+  note: "production-ready AuthProvider (Supabase Auth) behind the seam \u2014 closes\
+    \ OPEN-S3-2"
+  run_id: 2026-08-10-174536-foundation-auth-foundation
+- id: jrn-s2
+  repo: arxus
+  kind: journey
+  journey: JRN-S2
+  depends_on:
+  - auth-foundation
+  status: ready
+  dry_outcome: escalated
+  note: 'published seller with a live listing (needs an authenticated seller) [ruled:
+    re-dispatch after sandboxes]'
+- id: jrn-b3
+  repo: arxus
+  kind: journey
+  journey: JRN-B3
+  depends_on:
+  - auth-foundation
+  status: ready
+  dry_outcome: accepted
+  note: 'NDA -> tiered document access (needs an authenticated buyer) [ruled: re-dispatch
+    after sandboxes]'
+- id: ratify-rubric
+  kind: decision
+  status: awaiting_human
+  note: "OPEN-S3-1 \u2014 ratify the readiness rubric before production (launch gate)"
+- id: ratify-benchmarks
+  kind: decision
+  status: awaiting_human
+  note: "OPEN-VAL1 \u2014 ratify the valuation benchmark table before production (launch\
+    \ gate)"

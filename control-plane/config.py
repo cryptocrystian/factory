@@ -22,6 +22,7 @@ class Role:
     tools: tuple[str, ...]                       # OMP tool vocabulary (glob, not ls/find; strict validation)
     system_md: str                               # path under agents/<role>/system.md
     output_type: str
+    timeout_s: int = 900                         # per-call OMP wall-clock ceiling (I9), tuned per role
 
 
 # OMP tool sets (verified names). Read-only = read,grep,glob; add write/edit/bash per role.
@@ -30,14 +31,16 @@ _SRC = ("read", "write", "edit", "grep", "glob", "bash")     # builder: writes s
 
 ROLES: dict[str, Role] = {
     "planner": Role("planner", "claude-opus-5", "anthropic", "high",
-                    _RO + ("write",), "planner/system.md", "plan"),
-    "builder": Role("builder", "claude-opus-5", "anthropic", "xhigh",
-                    _SRC, "builder/system.md", "build"),
+                    _RO + ("write",), "planner/system.md", "plan", timeout_s=900),
+    # builder: capability-bound, but a full feature build needs a real single-call window. `xhigh`
+    # thinking at a short timeout churned (never converged); `medium` + 25 min lets it finish in one call.
+    "builder": Role("builder", "claude-opus-5", "anthropic", "medium",
+                    _SRC, "builder/system.md", "build", timeout_s=1500),
     # test-author + reviewer: DIFFERENT family from the builder (I3, mandatory).
     "test-author": Role("test-author", "gpt-5.6-sol", "openai", "high",
-                        _SRC, "test-author/system.md", "test"),
+                        _SRC, "test-author/system.md", "test", timeout_s=900),
     "reviewer": Role("reviewer", "gpt-5.6-terra", "openai", "high",
-                     _RO + ("bash",), "reviewer/system.md", "review"),
+                     _RO + ("bash",), "reviewer/system.md", "review", timeout_s=600),
 }
 
 # Per-role repo write grant (I6), enforced post-hoc by permissions.py. None=unrestricted, []=read-only.
@@ -55,7 +58,7 @@ PROTECTED_PATHS = ("canon/**", "supabase/migrations/**", ".git/**")
 
 @dataclass
 class Budget:
-    max_wall_s: int = 3600
+    max_wall_s: int = 2700                        # per-phase wall cap across resumes — stop churning, escalate
     max_retries_per_phase: int = 2
     # token ceiling left open until tracer usage semantics are pinned (P0 finding)
 
