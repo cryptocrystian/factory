@@ -22,7 +22,8 @@ from pathlib import Path
 CP = Path(__file__).resolve().parent.parent / "control-plane"
 sys.path.insert(0, str(CP))
 
-MAX_FIX_ITERS = 3          # bounded fix loop (I9): converge or escalate
+MAX_FIX_ITERS = 3          # bounded builder fix loop (I9): converge or escalate
+MAX_ARCH_ROUNDS = 2        # bounded architect authority loop: resolve protected-path findings or escalate
 
 import config, omp, gates, permissions as perm
 import envelopes as E
@@ -89,6 +90,7 @@ class Lane:
     def run(self) -> bool:
         run = Run(self.repo, lane="feature", target=self.journey)
         self._agent_gates_ok = True
+        self._human_brief = None                 # set by the architect when it surfaces a decision
         run.tracer.log(event_detail="lane_start", journey=self.journey, mode="live" if self.live else "replay")
 
         # -- resolve (I7: canon gap halts) ------------------------------------
@@ -120,7 +122,13 @@ class Lane:
         accepted = l0_ok and unit_ok[0] and approved and self._agent_gates_ok
         if not accepted:
             accepted = self._converge(run, findings, unit_ok[1])
-        return run.finish(accepted, reason="" if accepted else "did not converge")
+        # The builder can't write protected paths (migrations, canon). When it can't converge, the
+        # architect — the authority over those paths — takes over: it resolves technical findings
+        # against canon and escalates only genuine business/product decisions. This is what closes
+        # the governance loop so a human is not the trigger.
+        if not accepted:
+            accepted = self._architect_resolve(run)
+        return run.finish(accepted, reason="" if accepted else self._escalation_reason())
 
     def remediate(self, findings: str) -> bool:
         """Close open review findings on an already-built journey, via the bounded fix loop."""
@@ -263,6 +271,73 @@ class Lane:
                 return True
         run.tracer.log(event_detail="not_converged", iters=MAX_FIX_ITERS)
         return False
+
+    def _architect_resolve(self, run) -> bool:
+        """The architect authority loop — closes the governance hole. Invoked when the builder can't
+        converge, which is almost always because the fix lives in a protected path the builder may
+        not write (a migration, canon). The architect triages the reviewer's blocking findings,
+        resolves the technical ones against canon (authoring the migration/decision — verified by a
+        deterministic Postgres gate, not self-attestation), hands app-logic fixes back to the builder,
+        and escalates ONLY genuine business/product decisions. Bounded. True iff the build is accepted.
+
+        The write-grant (permissions.py) structurally confines the architect to migrations + canon: it
+        cannot touch tests or app source, so it can never green a build by weakening the tests. Canon
+        it can write — the never-weaken-canon rule is held by its charter, the different-family tests
+        it cannot edit, and the audit trail here."""
+        approved, findings, _ = self._review(run)          # current blocking findings post-builder-loop
+        if approved:
+            return True
+        for i in range(1, MAX_ARCH_ROUNDS + 1):
+            (run.dir / f"arch-findings-{i}.md").write_text(
+                "# Blocking findings the builder could not close\n\n" + "\n".join(f"- {f}" for f in findings))
+            arch = self._agent(run, "architect", "architect",
+                prompt=(f"The builder's fix loop could not close the findings in arch-findings-{i}.md "
+                        "(added run dir) — they require a protected path only you may write (a database "
+                        "migration or a canonical decision). Read context.md for governing canon. Triage "
+                        "each finding; resolve the technical ones by authoring the migration/decision that "
+                        "makes the build satisfy canon, and validate any migration against real Postgres "
+                        "(docker). NEVER weaken canon, tests, or invariants to pass. Put any genuine "
+                        "product or business decision in human_brief instead of resolving it. Return your "
+                        "envelope."),
+                cwd=run.workspace, add_dirs=[run.dir], gate_fns=[])
+            if arch is None:
+                return False
+            # A surfaced product/business decision — stop and escalate with the packaged brief.
+            hb = getattr(arch, "human_brief", {}) or {}
+            classes = {getattr(f, "finding_class", "technical") for f in getattr(arch, "findings", [])}
+            if hb.get("needed") or (classes & {"product", "business"}):
+                self._human_brief = hb or {"needed": True, "question": getattr(arch, "summary", "")}
+                run.tracer.log(event_detail="architect_escalate",
+                               human_brief=self._human_brief, classes=sorted(classes))
+                return False
+            # Verify architect-authored migrations by CODE (agent proposes, code disposes).
+            if (run.workspace / "supabase" / "migrations").exists():
+                mg = gates.migration_gate()(None, run)
+                run.tracer.gate(mg)
+                if not mg.passed:
+                    findings = [f"your migration did not apply cleanly — fix it: {mg.evidence[-600:]}"]
+                    continue                       # let the architect repair its own migration next round
+            run.commit(getattr(arch, "commit_message", None) or f"architect({self.journey}): round {i}")
+            # Hand app-logic fixes back to the builder's bounded loop — the protected path now exists.
+            brief = getattr(arch, "remediation_brief", "") or \
+                    "Apply the architect's resolution; make the build satisfy canon. Source only."
+            if self._converge(run, [brief], ""):
+                run.tracer.log(event_detail="architect_resolved", round=i)
+                return True
+            approved, findings, _ = self._review(run)       # fresh findings for the next architect round
+            if approved:
+                return True
+        run.tracer.log(event_detail="architect_not_resolved", rounds=MAX_ARCH_ROUNDS)
+        return False
+
+    def _escalation_reason(self) -> str:
+        """What the run reports on escalation. A surfaced decision is a packaged business/product
+        question (→ the human/PM); otherwise it's an unresolved technical residue."""
+        hb = getattr(self, "_human_brief", None)
+        if hb and hb.get("needed"):
+            q = hb.get("question", "")
+            return f"decision needed: {q}" if q else "decision needed (see architect human_brief)"
+        return "did not converge (architect could not resolve technically)"
 
     # -- prompts (live only; replay ignores them) ------------------------------
     def _planner_prompt(self, run):

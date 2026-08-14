@@ -93,6 +93,14 @@ def cmd_gate(name: str, command: str):
     return _gate
 
 
+def migration_gate():
+    """Apply every migration to a throwaway Postgres and fail if any doesn't apply clean. This makes
+    an architect-authored migration verified by CODE (agent proposes, code disposes), not by the
+    agent's own attestation. No-op (exit 0) for repos without supabase/migrations."""
+    script = Path(__file__).resolve().parent / "validate_migrations.sh"
+    return cmd_gate("migrations:apply", f"bash {script} supabase/migrations")
+
+
 def impeccable_gate(version: str, paths: str):
     """Anti-slop design gate (I8): the Impeccable detector must find no non-advisory findings.
 
