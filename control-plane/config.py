@@ -41,6 +41,17 @@ ROLES: dict[str, Role] = {
                         _SRC, "test-author/system.md", "test", timeout_s=900),
     "reviewer": Role("reviewer", "gpt-5.6-terra", "openai", "high",
                      _RO + ("bash",), "reviewer/system.md", "review", timeout_s=600),
+    # architect: the technical authority. Resolves reviewer findings the builder can't (protected
+    # paths — migrations, canon) so the factory self-governs; surfaces only genuine business/product
+    # decisions. Anthropic family (capability-bound authoring) — gated by the openai reviewer and
+    # cross-checked by the openai PM (I3: architect ≠ reviewer/PM family). Needs bash to validate
+    # migrations against real Postgres in-loop.
+    "architect": Role("architect", "claude-opus-5", "anthropic", "high",
+                      _SRC, "architect/system.md", "architect", timeout_s=1800),
+    # product manager: rules routine product decisions the architect routes to it, surfacing only
+    # owner-level business forks. DIFFERENT family from the architect (cross-check).
+    "product-manager": Role("product-manager", "gpt-5.6-sol", "openai", "high",
+                            _RO + ("write",), "product-manager/system.md", "architect", timeout_s=1200),
 }
 
 # Per-role repo write grant (I6), enforced post-hoc by permissions.py. None=unrestricted, []=read-only.
@@ -49,6 +60,12 @@ WRITE_GRANTS: dict[str, list[str] | None] = {
     "builder": ["**"],                           # source; permissions.py additionally forbids protected paths
     "test-author": ["tests/**"],                 # tests only — the producer never writes tests it is judged by
     "reviewer": [],                              # writes nothing to the repo
+    # The architect is the ONLY role granted the protected paths (migrations + canon) — the authority
+    # the builder lacks. Named explicitly (not "**"), so permissions.py permits these protected paths
+    # for it alone. It does NOT get app source: app-logic fixes go back to the builder as a remediation
+    # brief, keeping author/verifier separation intact.
+    "architect": ["supabase/migrations/**", "canon/**"],
+    "product-manager": ["canon/**"],             # rules routine product decisions into canon (AC/DEC)
 }
 
 # Paths no agent in a run may write (I12 + I3): factory machinery lives elsewhere; within a repo,

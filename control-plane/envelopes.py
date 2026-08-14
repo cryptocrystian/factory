@@ -52,11 +52,32 @@ class ReviewOutput(EnvelopeBase):
     notes_for_human: str = ""
 
 
+class ArchitectFinding(BaseModel):
+    model_config = {"populate_by_name": True, "extra": "allow"}
+    ref: str = ""
+    finding_class: Literal["technical", "product", "business"] = Field("technical", alias="class")
+    disposition: Literal["resolved", "remediation_brief", "escalate"] = "escalate"
+    action: str = ""
+    authored: list[str] = Field(default_factory=list)   # protected-path files the architect wrote
+    validation: str = ""                                # e.g. postgres validation result
+
+
+class ArchitectOutput(EnvelopeBase):
+    """The architect's triage of the reviewer's blocking findings: what it resolved against canon
+    (never by weakening it), what the builder must still fix, and the one thing (if any) a human
+    must decide. canon_integrity is its attestation that no test/invariant/AC was weakened to pass."""
+    findings: list[ArchitectFinding] = Field(default_factory=list)
+    remediation_brief: str = ""
+    human_brief: dict = Field(default_factory=dict)
+    canon_integrity: str = ""
+
+
 ENVELOPE_TYPES: dict[str, type[EnvelopeBase]] = {
     "plan": PlanOutput,
     "build": BuildOutput,
     "test": TestOutput,
     "review": ReviewOutput,
+    "architect": ArchitectOutput,
 }
 
 
