@@ -296,20 +296,26 @@ class Lane:
                         "migration or a canonical decision). Read context.md for governing canon. Triage "
                         "each finding; resolve the technical ones by authoring the migration/decision that "
                         "makes the build satisfy canon, and validate any migration against real Postgres "
-                        "(docker). NEVER weaken canon, tests, or invariants to pass. Put any genuine "
-                        "product or business decision in human_brief instead of resolving it. Return your "
-                        "envelope."),
+                        "(docker). NEVER weaken canon, tests, or invariants to pass. Follow the launch-gate "
+                        "doctrine (DEC-052/055/056): when the open question is a provider/dataset/roster, "
+                        "BUILD the mechanism behind the seam with a build seed so the journey is acceptable "
+                        "now, and record the real roster as a launch-gate sign-off in human_brief — do NOT "
+                        "leave the build blocked on it. Return your envelope."),
                 cwd=run.workspace, add_dirs=[run.dir], gate_fns=[])
             if arch is None:
                 return False
-            # A surfaced product/business decision — stop and escalate with the packaged brief.
+            # Record any surfaced decision as a PENDING SIGN-OFF — do not treat it as a blocker here.
+            # Whether it truly blocks is decided by the reviewer below: if the build (with the seam +
+            # build seed the architect installed) passes review, the decision is a non-blocking
+            # launch-gate sign-off surfaced to the owner; if review still fails, the run escalates.
             hb = getattr(arch, "human_brief", {}) or {}
-            classes = {getattr(f, "finding_class", "technical") for f in getattr(arch, "findings", [])}
-            if hb.get("needed") or (classes & {"product", "business"}):
-                self._human_brief = hb or {"needed": True, "question": getattr(arch, "summary", "")}
-                run.tracer.log(event_detail="architect_escalate",
-                               human_brief=self._human_brief, classes=sorted(classes))
-                return False
+            if hb.get("needed"):
+                self._human_brief = hb
+                (run.dir / "human_brief.md").write_text(
+                    f"# Decision for the owner\n\n**Q:** {hb.get('question','')}\n\n"
+                    f"**Why:** {hb.get('why','')}\n\n**Options:** {hb.get('options',[])}\n\n"
+                    f"**Recommendation:** {hb.get('recommendation','')}\n")
+                run.tracer.log(event_detail="architect_surfaced_decision", human_brief=hb)
             # Verify architect-authored migrations by CODE (agent proposes, code disposes).
             if (run.workspace / "supabase" / "migrations").exists():
                 mg = gates.migration_gate()(None, run)
@@ -317,17 +323,26 @@ class Lane:
                 if not mg.passed:
                     findings = [f"your migration did not apply cleanly — fix it: {mg.evidence[-600:]}"]
                     continue                       # let the architect repair its own migration next round
+            # Commit the architect's resolution (migrations/canon), THEN apply the app-logic remediation
+            # via the builder's bounded loop. The reviewer inside _converge is the arbiter of acceptance.
             run.commit(getattr(arch, "commit_message", None) or f"architect({self.journey}): round {i}")
-            # Hand app-logic fixes back to the builder's bounded loop — the protected path now exists.
             brief = getattr(arch, "remediation_brief", "") or \
                     "Apply the architect's resolution; make the build satisfy canon. Source only."
             if self._converge(run, [brief], ""):
-                run.tracer.log(event_detail="architect_resolved", round=i)
+                # Accepted. Any surfaced decision is a NON-BLOCKING launch-gate sign-off (fail-closed),
+                # recorded for the owner — it did not block the green.
+                run.tracer.log(event_detail="architect_resolved", round=i,
+                               pending_signoff=bool(self._human_brief))
                 return True
             approved, findings, _ = self._review(run)       # fresh findings for the next architect round
             if approved:
+                run.tracer.log(event_detail="architect_resolved", round=i,
+                               pending_signoff=bool(self._human_brief))
                 return True
-        run.tracer.log(event_detail="architect_not_resolved", rounds=MAX_ARCH_ROUNDS)
+        # Rounds exhausted without acceptance: the residue genuinely blocks — escalate (with the
+        # architect's packaged decision if it surfaced one, else the technical residue).
+        run.tracer.log(event_detail="architect_not_resolved", rounds=MAX_ARCH_ROUNDS,
+                       human_brief=self._human_brief or {})
         return False
 
     def _escalation_reason(self) -> str:
