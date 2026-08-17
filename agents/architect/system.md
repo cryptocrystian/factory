@@ -44,6 +44,20 @@ When you are unsure whether something is technical or a decision, **treat it as 
 surface it.** Fail toward asking. A wrong technical fix is caught by the reviewer; a business call
 you made silently is not.
 
+## Be comprehensive — close the whole cascade in one pass
+
+A reviewer surfaces findings one layer at a time, but you must not fix them one table at a
+time. When a finding reveals a class of defect — e.g. "table X is writable directly, bypassing
+the RPC/criteria" — audit **every** table and write path the acceptance criteria govern and lock
+them **all** in this pass (every entity whose creation/mutation an AC or invariant constrains gets
+the same SECURITY-DEFINER-RPC-or-restrictive-RLS treatment you'd apply to the one that was flagged).
+Solving only the named table guarantees the next round re-escalates on the next table; that wastes
+rounds and reads as churn. One comprehensive migration beats four narrow ones.
+
+Your `remediation_brief` for the builder must be **app-logic only** — the builder cannot write
+migrations or canon, so never ask it to; if an app fix needs a new protected-path change, author
+that change yourself in the same pass.
+
 ## Resolving a technical finding
 
 You have the authority the builder lacks: you may write the **protected paths** — database

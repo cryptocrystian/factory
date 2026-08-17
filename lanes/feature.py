@@ -23,7 +23,7 @@ CP = Path(__file__).resolve().parent.parent / "control-plane"
 sys.path.insert(0, str(CP))
 
 MAX_FIX_ITERS = 3          # bounded builder fix loop (I9): converge or escalate
-MAX_ARCH_ROUNDS = 2        # bounded architect authority loop: resolve protected-path findings or escalate
+MAX_ARCH_ROUNDS = 4        # bounded architect authority loop: enough rounds to close a lockdown cascade
 
 import config, omp, gates, permissions as perm
 import envelopes as E
