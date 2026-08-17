@@ -97,6 +97,15 @@ class WorktreeIsolation:
         return IsolatedWorkspace(self, origin, wt, branch, base_branch, base_commit, symlinks)
 
     def merge_back(self, ws: IsolatedWorkspace, accepted: bool) -> MergeResult:
+        # Drop the shared_ignored symlinks (node_modules) BEFORE staging: they are run scaffolding,
+        # never content, and a dir-only gitignore (`node_modules/`) does not match a symlink, so an
+        # `add -A` would otherwise commit them into origin and leave every future run's tree dirty (I4).
+        for link in ws._symlinks:
+            try:
+                if link.is_symlink():
+                    link.unlink()
+            except OSError:
+                pass
         # Capture residue on the work branch so a missed boundary-commit loses nothing (honesty).
         if ws.dirty():
             ws.git("add", "-A")
