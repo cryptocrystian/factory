@@ -30,6 +30,7 @@ CP = FACTORY_ROOT / "control-plane"
 sys.path.insert(0, str(CP))
 import obsdb
 import notifier as notifier_mod
+import canon
 
 DONE = {"accepted", "done"}
 LANE = str(FACTORY_ROOT / "lanes" / "feature.py")
@@ -175,6 +176,136 @@ def run_orchestrator(dry_run=False, once=False):
     report(items, acted, dry_run)
 
 
+# ----------------------------------------------------------------------------- continuous parallel daemon
+def _verdict(target):
+    """Read the latest run's TRUE finish for `target`: (accepted, merged, run_id, blocking).
+    `merged` distinguishes a real acceptance from a build that was accepted but lost the merge race
+    on a moving base (I11) — the latter is re-queued, not escalated."""
+    import json
+    run = _latest_run(target)
+    if not run:
+        return False, False, None, ["run produced no verdict"]
+    run_id = run["run_id"]
+    conn = obsdb.connect()
+    try:
+        r = obsdb.get_run(conn, run_id)
+    finally:
+        conn.close()
+    accepted = merged = False
+    for e in (r["events"] if r else []):
+        d = json.loads(e["detail"]) if e.get("detail") else {}
+        if d.get("event_detail") == "finish":
+            accepted = bool(d.get("accepted")); merged = bool(d.get("merged"))
+    blocking = [] if accepted else _blocking(run_id)
+    return accepted, merged, run_id, blocking
+
+
+def _target_of(item):
+    return item["id"] if item["kind"] == "foundation" else item.get("journey", item["id"])
+
+
+# --- decomposition gate (Rev4 §9): only parallelize streams with disjoint artifact bindings -------
+_WILDCARD = frozenset({"*"})                       # unknown scope → conflicts with everything → serial
+
+
+def _bindings(item) -> frozenset:
+    """The artifact bindings the control plane schedules on. A journey's are its canon `Touches`
+    entities; a foundation (or an unresolvable journey) is treated as touching everything, so it
+    runs alone. This is what lets the daemon run non-overlapping journeys in parallel and SERIALIZE
+    overlapping ones, instead of firing blindly and thrashing on merges."""
+    if item.get("kind") == "foundation":
+        return _WILDCARD
+    jid = item.get("journey") or item["id"]
+    try:
+        b = canon.CanonResolver(Path(repo_path(item["repo"]))).bindings(jid)
+    except Exception:
+        b = set()
+    return frozenset(b) if b else _WILDCARD
+
+
+def _overlaps(a: frozenset, b: frozenset) -> bool:
+    return ("*" in a) or ("*" in b) or bool(a & b)
+
+
+def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
+    """The factory as a running system, not a pipeline. Loops forever: dispatch up to N ready items
+    CONCURRENTLY (each isolated in its own worktree), reap finished ones, and NEVER stop on a
+    decision — an escalation parks the item as `escalated` and the loop keeps churning everything
+    else, re-picking work the instant a human unblocks it. Run under systemd for 24/7 operation."""
+    nt = notifier_mod.get_notifier()
+    inflight: dict[str, tuple] = {}                    # item_id -> (live subprocess, its bindings)
+    merge_retries: dict[str, int] = {}
+    conflicts = 0                                      # merge-conflict feedback (should stay near zero)
+    # A prior daemon may have died mid-flight; systemd's cgroup kill takes its children too, so any
+    # in_progress item is stale — reset it to ready so it re-runs cleanly.
+    data = load()
+    for it in data["items"]:
+        if it.get("status") == "in_progress":
+            it["status"] = "ready"
+    save(data)
+    print(f"▶ daemon up — max_parallel={max_parallel}, poll={poll_s}s, continuous", flush=True)
+    while True:
+        data = load(); items = data["items"]; by_id = {i["id"]: i for i in items}
+        # --- reap finished runs ------------------------------------------------
+        for iid, (proc, _b) in list(inflight.items()):
+            if proc.poll() is None:
+                continue
+            del inflight[iid]
+            item = by_id.get(iid)
+            if not item:
+                continue
+            accepted, merged, run_id, blocking = _verdict(_target_of(item))
+            item["run_id"] = run_id
+            if accepted and merged:
+                item["status"] = "accepted"
+                print(f"  ✓ accepted  {iid}", flush=True)
+                nt.accepted(project=item.get("repo", "—"), item_id=iid, kind=item["kind"],
+                            note=item.get("note", ""), run_id=run_id)
+            elif accepted and not merged:                # lost the merge race on a moving base (I11)
+                conflicts += 1                           # decomposition-gate feedback signal
+                n = merge_retries.get(iid, 0) + 1; merge_retries[iid] = n
+                if n <= max_merge_retries:
+                    item["status"] = "ready"             # rebuild on the new base — NOT a human escalation
+                    print(f"  ↻ re-queue  {iid}  (merge race, attempt {n}/{max_merge_retries})", flush=True)
+                else:
+                    item["status"] = "escalated"
+                    escalate(item, run_id, ["repeated merge conflict — could not land on a moving base (I11)"])
+                    nt.escalation(project=item.get("repo", "—"), item_id=iid, kind=item["kind"],
+                                  note=item.get("note", ""), run_id=run_id,
+                                  blocking=["repeated merge conflict (I11)"])
+                    print(f"  ⚑ escalated {iid}  (merge race x{n})", flush=True)
+            else:                                        # genuine escalation — park, notify, keep going
+                item["status"] = "escalated"
+                escalate(item, run_id, blocking)
+                nt.escalation(project=item.get("repo", "—"), item_id=iid, kind=item["kind"],
+                              note=item.get("note", ""), run_id=run_id, blocking=blocking)
+                print(f"  ⚑ escalated {iid}  → awaiting your ruling (factory keeps running)", flush=True)
+        # --- allocate + dispatch (Rev4 §9): WIP limit + decomposition gate ----
+        # Only co-schedule streams whose artifact bindings are DISJOINT from everything already in
+        # flight (and from each other this cycle). Overlapping work is serialized — it waits for the
+        # conflicting run to finish — instead of racing to a merge conflict. This is what makes it
+        # the designed `allocate` step rather than a naive parallel loop.
+        held = [b for (_p, b) in inflight.values()]    # bindings currently in flight
+        for item in ready(items):
+            if len(inflight) >= max_parallel:
+                break
+            if item["id"] in inflight:
+                continue
+            b = _bindings(item)
+            if any(_overlaps(b, h) for h in held):
+                print(f"  ⋯ hold      {item['id']}  (bindings {sorted(b)} overlap in-flight — serialized)", flush=True)
+                continue                               # decomposition gate: serialize, don't collide
+            item["status"] = "in_progress"
+            # children stay in the daemon's cgroup, so systemd stop/restart reaps them (no orphans)
+            proc = subprocess.Popen(_cmd(item), cwd=str(FACTORY_ROOT))
+            inflight[item["id"]] = (proc, b)
+            held.append(b)
+            print(f"  ▶ dispatch  {item['id']}  ({item['kind']}) bindings={sorted(b)} "
+                  f"[{len(inflight)}/{max_parallel} in flight, {conflicts} merge-conflicts so far]", flush=True)
+        save(data)
+        time.sleep(poll_s)
+
+
 def report(items, acted, dry_run):
     done = {i["id"] for i in items if i.get("status") in DONE}
     print("\n" + ("── DRY RUN " if dry_run else "── ") + "orchestrator report " + "─" * 30)
@@ -202,10 +333,17 @@ def main(argv):
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="simulate dispatch outcomes (no lanes run)")
     ap.add_argument("--once", action="store_true", help="dispatch a single ready item, then stop")
+    ap.add_argument("--daemon", action="store_true",
+                    help="run forever: dispatch N journeys concurrently, park escalations, never stop")
+    ap.add_argument("--max-parallel", type=int, default=3, help="max concurrent journeys in --daemon")
+    ap.add_argument("--poll", type=int, default=20, help="daemon poll interval seconds")
     a = ap.parse_args(argv)
     if not BACKLOG.exists():
         print(f"no backlog at {BACKLOG}"); sys.exit(1)
-    run_orchestrator(dry_run=a.dry_run, once=a.once)
+    if a.daemon:
+        run_daemon(max_parallel=a.max_parallel, poll_s=a.poll)
+    else:
+        run_orchestrator(dry_run=a.dry_run, once=a.once)
 
 
 if __name__ == "__main__":

@@ -57,6 +57,20 @@ class CanonResolver:
     def journey(self, jid: str) -> str:
         return self._block(self._journeys, rf"### {re.escape(jid)} ")
 
+    def bindings(self, jid: str) -> set[str]:
+        """The journey's artifact bindings for the orchestrator's decomposition gate (Rev4 §9): the
+        entity set its `Touches:` line declares (the backticked names before the first `·`). Two
+        journeys with disjoint bindings are safe to run in parallel; overlap serializes them. Empty
+        set = unknown scope — the caller treats that as touching everything (conservatively serial)."""
+        block = self._block(self._journeys, rf"### {re.escape(jid)} ")
+        if not block:
+            return set()
+        m = re.search(r"\*\*Touches:\*\*\s*([^\n]*)", block)
+        if not m:
+            return set()
+        head = m.group(1).split("·")[0]                 # entities precede the first ' · ' separator
+        return set(re.findall(r"`([^`]+)`", head))
+
     def acceptance(self, jid: str) -> str:
         # AC groups journeys under "## JRN-S1 — <name>"
         return self._block(self._ac, rf"## {re.escape(jid)} ", stop_pats=(r"\n## ",))
