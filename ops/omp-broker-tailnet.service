@@ -1,0 +1,18 @@
+[Unit]
+# Exposes the auth-broker to exe.dev worker VMs over the PRIVATE tailnet only — never the public
+# internet. A socat forwarder binds the VPS's tailnet IP (100.103.168.32:9099) and forwards to the
+# localhost broker (127.0.0.1:9099). Local auth (the VPS's own factory) keeps using 127.0.0.1,
+# untouched and decoupled from tailscale. Requires: socat installed; tailscale up on the VPS.
+# NOTE: the bind IP is this VPS's tailnet address — change it if the VPS's tailnet IP changes.
+Description=Expose the auth-broker on the tailnet only (exe.dev VM auth-borrow) — never public
+After=tailscaled.service omp-auth-broker.service
+Wants=tailscaled.service omp-auth-broker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/socat TCP-LISTEN:9099,bind=100.103.168.32,fork,reuseaddr TCP:127.0.0.1:9099
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
