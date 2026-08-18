@@ -62,7 +62,7 @@ else:
 #    Recorded from the 2026-08-18 outage, where a rate-limited reviewer was turned into the
 #    synthetic finding "no review envelope" and drove three builder fix-iterations per journey.
 print("provider-failure classification:")
-FIX = HERE.parent / "runs" / "_fixtures"
+FIX = HERE / "fixtures"
 cases = [("codex-usage-limit.jsonl", "usage_limit_reached", 1800.0),
          ("anthropic-overloaded.jsonl", "overloaded_error", 0.0)]
 for fname, needle, want_wait in cases:
