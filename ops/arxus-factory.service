@@ -1,0 +1,23 @@
+[Unit]
+Description=Arxus factory — continuous parallel orchestrator daemon (§9 allocate: WIP + decomposition gate)
+After=network-online.target omp-auth-broker.service
+Wants=network-online.target omp-auth-broker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/factory
+Environment=TERM=dumb
+Environment=HOME=/root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin
+# Runs forever: dispatch up to N non-overlapping journeys concurrently, park escalations without
+# stopping. N=2 = the concurrency one subscription sustains; raise once the worker tier scales.
+ExecStart=/root/.local/bin/uv run orchestrator.py --daemon --max-parallel 2 --poll 20
+Restart=always
+RestartSec=10
+# Kill the whole cgroup on stop/restart so in-flight journey subprocesses are reaped (no orphans).
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
