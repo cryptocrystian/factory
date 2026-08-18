@@ -33,10 +33,11 @@ check("prose-wrapped", omp._json_slice('done {"x":2} ok').strip() == '{"x":2}')
 # 2. review stream -> ReviewOutput (clean bare JSON final message)
 print("review-phase.jsonl -> ReviewOutput:")
 lines = (RUN / "review-phase.jsonl").read_text().splitlines()
-sid, final, cost, n = omp._parse_stream(lines)
+sid, final, cost, n, perr, wait = omp._parse_stream(lines)
 check("session id present", bool(sid), sid or "")
 check("events counted", n > 100, f"{n} events")
 check("cost captured", cost > 0, f"${cost:.4f}")
+check("healthy stream flags no provider error", not perr and wait == 0.0)
 rv = E.ReviewOutput.model_validate_json(omp._json_slice(final))
 check("validates ReviewOutput", rv.status == "success")
 check("approved is bool", isinstance(rv.approved, bool), f"approved={rv.approved}")
@@ -46,7 +47,7 @@ check("has blocking finding", any(f.severity == "blocking" for f in rv.findings)
 # 3. build stream -> BuildOutput (final envelope after tool calls)
 print("build-fix2.jsonl -> BuildOutput:")
 bl = (RUN / "build-fix2.jsonl").read_text().splitlines()
-bsid, bfinal, bcost, bn = omp._parse_stream(bl)
+bsid, bfinal, bcost, bn, _bperr, _bwait = omp._parse_stream(bl)
 check("session id present", bool(bsid), bsid or "")
 if bfinal.strip().startswith("{") or "{" in bfinal:
     try:
@@ -56,6 +57,30 @@ if bfinal.strip().startswith("{") or "{" in bfinal:
         check("validates BuildOutput", False, str(ex)[:80])
 else:
     check("build final present", False, "no JSON final (timed-out phase) — expected for some")
+
+# 4. provider-failure classification: a rate limit / overload is INFRA, not a review finding.
+#    Recorded from the 2026-08-18 outage, where a rate-limited reviewer was turned into the
+#    synthetic finding "no review envelope" and drove three builder fix-iterations per journey.
+print("provider-failure classification:")
+FIX = HERE.parent / "runs" / "_fixtures"
+cases = [("codex-usage-limit.jsonl", "usage_limit_reached", 1800.0),
+         ("anthropic-overloaded.jsonl", "overloaded_error", 0.0)]
+for fname, needle, want_wait in cases:
+    f = FIX / fname
+    if not f.exists():
+        check(f"{fname} fixture present", False, "missing")
+        continue
+    _s, fin, _c, _n, perr, wait = omp._parse_stream(f.read_text().splitlines())
+    check(f"{fname}: provider error captured", needle in perr, perr[:60])
+    check(f"{fname}: no envelope text", not fin)
+    check(f"{fname}: advertised wait {want_wait}s", wait == want_wait, f"got {wait}")
+    res = omp.AgentResult(ok=False, envelope=None, session_id=None, cost_usd=0.0, timed_out=False,
+                          events=_n, raw_final=fin, error="", provider_error=perr, retry_after_s=wait)
+    check(f"{fname}: infra_failed", res.infra_failed)
+# a model that answered but garbled its envelope is NOT infra — it gets re-prompted, not backed off
+behaved = omp.AgentResult(ok=False, envelope=None, session_id="s", cost_usd=0.0, timed_out=False,
+                          events=9, raw_final="not json", error="envelope parse failed")
+check("parse failure is not infra", not behaved.infra_failed)
 
 print("\nK1 adapter-spine self-test:", "ALL PASS" if ok else "FAILURES")
 sys.exit(0 if ok else 1)

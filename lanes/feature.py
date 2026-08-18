@@ -31,6 +31,23 @@ from canon import CanonResolver
 from session import Run
 
 
+class PhaseUnavailable(Exception):
+    """A phase produced no output for a reason no amount of building can fix, so the run must STOP
+    rather than fabricate work. Two cases:
+
+      infra      — the provider itself failed (rate limit, overload). Nothing downstream is real.
+      no_verdict — the reviewer emitted no envelope. Acceptance is undecidable, and feeding the
+                   builder a synthetic "no review envelope" finding sends it to fix nothing: that
+                   burned three builder iterations per journey on 2026-08-18 while the cross-family
+                   reviewer sat rate-limited.
+
+    Either way the run is re-queued by the daemon (it logs `agent_no_envelope`), not escalated to a
+    human — there is no ruling to make."""
+    def __init__(self, kind: str, role: str, error: str, retry_after_s: float = 0.0):
+        super().__init__(f"{role}: {error}")
+        self.kind, self.role, self.error, self.retry_after_s = kind, role, error, retry_after_s
+
+
 # ----------------------------------------------------------------------------- runners
 class LiveRunner:
     """Drive OMP; on a mid-phase timeout, resume the same session — bounded by BOTH a retry count and a
@@ -64,7 +81,7 @@ class ReplayRunner:
 
     def run(self, call: E.AgentCall, run: Run, workspace: Path):
         lines = (self.rec / self.MAP[call.role]).read_text().splitlines()
-        sid, final, cost, n = omp._parse_stream(lines)
+        sid, final, cost, n, _perr, _wait = omp._parse_stream(lines)
         env = E.ENVELOPE_TYPES[call.output_type].model_validate_json(omp._json_slice(final))
         if call.role == "planner" and (self.rec / "plan.md").exists():
             (run.dir / "plan.md").write_text((self.rec / "plan.md").read_text())   # recreate the plan artifact
@@ -92,7 +109,12 @@ class Lane:
         self._agent_gates_ok = True
         self._human_brief = None                 # set by the architect when it surfaces a decision
         run.tracer.log(event_detail="lane_start", journey=self.journey, mode="live" if self.live else "replay")
+        try:
+            return self._feature_phases(run)
+        except PhaseUnavailable as e:
+            return self._abort(run, e)
 
+    def _feature_phases(self, run) -> bool:
         # -- resolve (I7: canon gap halts) ------------------------------------
         with run.phase(E.PhaseParams(name="resolve", kind="code", owner="canon",
                        description="Resolve governing canon for the journey by binding")) as ph:
@@ -135,7 +157,10 @@ class Lane:
         run = Run(self.repo, lane="remediate", target=self.journey)
         run.tracer.log(event_detail="remediate_start", journey=self.journey)
         (run.dir / "context.md").write_text(CanonResolver(self.repo).resolve(self.journey).markdown())
-        accepted = self._converge(run, [findings], "")
+        try:
+            accepted = self._converge(run, [findings], "")
+        except PhaseUnavailable as e:
+            return self._abort(run, e)
         return run.finish(accepted, reason="" if accepted else "did not converge")
 
     def foundation(self, brief: str) -> bool:
@@ -145,6 +170,12 @@ class Lane:
         self._agent_gates_ok = True
         run.tracer.log(event_detail="foundation_start", target=self.journey)
         (run.dir / "context.md").write_text(brief)
+        try:
+            return self._foundation_phases(run)
+        except PhaseUnavailable as e:
+            return self._abort(run, e)
+
+    def _foundation_phases(self, run) -> bool:
         plan = self._agent(run, "planner", "plan",
                            prompt=("Read context.md — a foundation brief (a cross-cutting build, not a "
                                    "single user journey). Produce plan.md and your envelope per your "
@@ -160,6 +191,14 @@ class Lane:
             accepted = self._converge(run, findings, unit_ok[1])
         return run.finish(accepted, reason="" if accepted else "did not converge")
 
+    def _abort(self, run, e: PhaseUnavailable) -> bool:
+        """End the run on an undecidable phase. NOT an escalation: there is no ruling for a human to
+        make about a rate-limited provider or a reviewer that never answered. The trace carries the
+        provider's requested cooldown so the daemon can wait exactly that long before re-queueing."""
+        run.tracer.log(event_detail="run_aborted_unavailable", kind=e.kind, role=e.role,
+                       error=e.error, retry_after_s=e.retry_after_s)
+        return run.finish(False, reason=f"{e.role} unavailable ({e.kind}): {e.error}")
+
     # -- phase helpers ---------------------------------------------------------
     def _agent(self, run, role, output_type, prompt, cwd, add_dirs, gate_fns, commit_msg=None):
         r = config.role(role)
@@ -169,7 +208,17 @@ class Lane:
                                add_dirs=[str(d) for d in add_dirs])
             res = self.runner.run(call, run, cwd)
             if not res.ok:
-                run.tracer.log(event_detail="agent_no_envelope", role=role, error=res.error)
+                retry_after = getattr(res, "retry_after_s", 0.0)
+                run.tracer.log(event_detail="agent_no_envelope", role=role, error=res.error,
+                               provider_error=getattr(res, "provider_error", ""),
+                               retry_after_s=retry_after)
+                # A provider outage makes every later phase meaningless; a missing REVIEW envelope
+                # makes acceptance undecidable. Both stop the run here (the daemon re-queues it)
+                # instead of walking the builder through phantom findings.
+                if getattr(res, "infra_failed", False):
+                    raise PhaseUnavailable("infra", role, res.error, retry_after)
+                if role == "reviewer":
+                    raise PhaseUnavailable("no_verdict", role, res.error, retry_after)
                 return None
             # write-enforcement against the isolated worktree (planner writes to run dir, not the
             # workspace, so enforce only for roles that operate in the worktree)
@@ -237,8 +286,10 @@ class Lane:
                            prompt=self._reviewer_prompt(run),
                            cwd=run.workspace, add_dirs=[run.dir],
                            gate_fns=[gates.verdict_consistent])
-        approved = bool(getattr(review, "approved", False)) if review else False
-        blocking = getattr(review, "blocking", []) if review else ["no review envelope"]
+        # _agent raises PhaseUnavailable when the reviewer emits no envelope, so a verdict here is
+        # always a real one — no synthetic "no review envelope" finding ever reaches the builder.
+        approved = bool(getattr(review, "approved", False))
+        blocking = list(getattr(review, "blocking", []) or [])
         run.tracer.log(event_detail="review_verdict", approved=approved, blocking=blocking)
         return approved, blocking, review
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 from dataclasses import dataclass, field
@@ -43,6 +44,15 @@ class AgentResult:
     events: int
     raw_final: str                 # the last assistant text (for diagnostics if parse failed)
     error: str = ""
+    provider_error: str = ""       # the provider's own error (rate limit, overload) if it emitted one
+    retry_after_s: float = 0.0     # the wait the provider asked for, in seconds (0 = none advertised)
+
+    @property
+    def infra_failed(self) -> bool:
+        """No envelope AND the provider itself errored — the model side was down, not misbehaving.
+        Distinct from a model that answered but produced an unparseable envelope: that's a behavior
+        problem the caller can re-prompt, this one only clears with time."""
+        return (not self.ok) and bool(self.provider_error)
 
 
 def _argv(call: E.AgentCall, r: config.Role, session_dir: Path) -> list[str]:
@@ -62,11 +72,13 @@ def _argv(call: E.AgentCall, r: config.Role, session_dir: Path) -> list[str]:
 
 
 def _parse_stream(lines: list[str]):
-    """Return (session_id, final_assistant_text, cost_usd, n_events, emit(event))."""
+    """Return (session_id, final_assistant_text, cost_usd, n_events, provider_error, retry_after_s)."""
     session_id = None
     final_text = ""
     max_cost = 0.0
     n = 0
+    provider_error = ""
+    retry_after_s = 0.0
     for ln in lines:
         ln = ln.strip()
         if not ln:
@@ -86,6 +98,19 @@ def _parse_stream(lines: list[str]):
             c = u.get("cost")
             if isinstance(c, dict):
                 max_cost = max(max_cost, float(c.get("total", 0.0)))
+        # Provider-side failure (rate limit, overload): the model never answered. OMP reports it as a
+        # message with stopReason "error", and — when the provider advertises a cooldown longer than
+        # OMP's own retry ceiling — an auto_retry_end that names the wait it asked for. Both are worth
+        # capturing: the first says "infra, not the model misbehaving", the second says how long.
+        if isinstance(msg, dict) and msg.get("stopReason") == "error" and msg.get("errorMessage"):
+            provider_error = str(msg["errorMessage"])
+        if t == "auto_retry_end" and not ev.get("success"):
+            fe = str(ev.get("finalError") or "")
+            if fe:
+                provider_error = provider_error or fe
+            m = re.search(r"[Pp]rovider requested (\d+)ms wait", fe)
+            if m:
+                retry_after_s = max(retry_after_s, int(m.group(1)) / 1000.0)
         if t == "agent_end":
             for m in ev.get("messages", []):
                 if m.get("role") == "assistant":
@@ -95,7 +120,7 @@ def _parse_stream(lines: list[str]):
                     )
                     if txt.strip():
                         final_text = txt.strip()
-    return session_id, final_text, max_cost, n
+    return session_id, final_text, max_cost, n, provider_error, retry_after_s
 
 
 # Where a host advertises the auth-broker to borrow OAuth from. A broker-env file holds
@@ -168,7 +193,7 @@ def run(call: E.AgentCall, run_dir: Path, workspace: Path, tracer=None) -> Agent
 
     lines = out.splitlines()
     (run_dir / f"{call.role}.jsonl").write_text(out)
-    session_id, final_text, cost, n = _parse_stream(lines)
+    session_id, final_text, cost, n, provider_error, retry_after_s = _parse_stream(lines)
     if tracer:
         tracer.record_call(call.role, n, cost, timed_out)
 
@@ -180,11 +205,13 @@ def run(call: E.AgentCall, run_dir: Path, workspace: Path, tracer=None) -> Agent
         except Exception as ex:  # parse/validate failure -> caller re-prompts same session (bounded)
             err = f"envelope parse failed: {ex}"
     else:
-        err = "no final assistant message (timed out mid-turn?)" if timed_out else "no envelope emitted"
+        err = (f"provider failure: {provider_error}" if provider_error else
+               "no final assistant message (timed out mid-turn?)" if timed_out else "no envelope emitted")
 
     return AgentResult(
         ok=envelope is not None, envelope=envelope, session_id=session_id,
         cost_usd=cost, timed_out=timed_out, events=n, raw_final=final_text, error=err,
+        provider_error=provider_error, retry_after_s=retry_after_s,
     )
 
 

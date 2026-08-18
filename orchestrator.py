@@ -178,13 +178,14 @@ def run_orchestrator(dry_run=False, once=False):
 
 # ----------------------------------------------------------------------------- continuous parallel daemon
 def _verdict(target):
-    """Read the latest run's TRUE finish for `target`: (accepted, merged, run_id, blocking).
+    """Read the latest run's TRUE finish for `target`: (accepted, merged, run_id, blocking,
+    transient, cooldown_s).
     `merged` distinguishes a real acceptance from a build that was accepted but lost the merge race
     on a moving base (I11) — the latter is re-queued, not escalated."""
     import json
     run = _latest_run(target)
     if not run:
-        return False, False, None, ["run produced no verdict"]
+        return False, False, None, ["run produced no verdict"], False, 0.0
     run_id = run["run_id"]
     conn = obsdb.connect()
     try:
@@ -192,6 +193,7 @@ def _verdict(target):
     finally:
         conn.close()
     accepted = merged = transient = False
+    cooldown = 0.0
     for e in (r["events"] if r else []):
         d = json.loads(e["detail"]) if e.get("detail") else {}
         ed = d.get("event_detail")
@@ -199,8 +201,12 @@ def _verdict(target):
             accepted = bool(d.get("accepted")); merged = bool(d.get("merged"))
         elif ed == "agent_no_envelope":
             transient = True                       # an agent produced no output — infra/model failure
+            cooldown = max(cooldown, float(d.get("retry_after_s") or 0.0))
+        elif ed == "run_aborted_unavailable":
+            transient = True                       # the lane stopped itself: undecidable, not a ruling
+            cooldown = max(cooldown, float(d.get("retry_after_s") or 0.0))
     blocking = [] if accepted else _blocking(run_id)
-    return accepted, merged, run_id, blocking, transient
+    return accepted, merged, run_id, blocking, transient, cooldown
 
 
 def _target_of(item):
@@ -259,7 +265,7 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
             item = by_id.get(iid)
             if not item:
                 continue
-            accepted, merged, run_id, blocking, transient = _verdict(_target_of(item))
+            accepted, merged, run_id, blocking, transient, cooldown = _verdict(_target_of(item))
             item["run_id"] = run_id
             if accepted and merged:
                 item["status"] = "accepted"
@@ -270,9 +276,14 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
                 n = infra_retries.get(iid, 0) + 1; infra_retries[iid] = n
                 if n <= 5:
                     item["status"] = "ready"             # NOT a human escalation — just try again, backed off
-                    back = min(60 * n, 600)
+                    # A provider that advertises its own cooldown (a rate limit says "wait 30 min")
+                    # outranks our schedule: retrying inside that window just burns the other family's
+                    # tokens on a run that cannot finish. Cap at an hour so a bogus number can't park
+                    # the queue indefinitely.
+                    back = min(max(min(60 * n, 600), int(cooldown)), 3600)
                     retry_after[iid] = time.monotonic() + back
-                    print(f"  ↻ retry     {iid}  (transient infra failure, attempt {n}, backoff {back}s)", flush=True)
+                    why = f"provider cooldown {int(cooldown)}s" if cooldown > min(60 * n, 600) else "transient infra failure"
+                    print(f"  ↻ retry     {iid}  ({why}, attempt {n}, backoff {back}s)", flush=True)
                 else:
                     item["status"] = "escalated"
                     escalate(item, run_id, ["repeated transient infra failure (model overloaded / no envelope)"])
