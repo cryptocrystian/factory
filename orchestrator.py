@@ -191,13 +191,16 @@ def _verdict(target):
         r = obsdb.get_run(conn, run_id)
     finally:
         conn.close()
-    accepted = merged = False
+    accepted = merged = transient = False
     for e in (r["events"] if r else []):
         d = json.loads(e["detail"]) if e.get("detail") else {}
-        if d.get("event_detail") == "finish":
+        ed = d.get("event_detail")
+        if ed == "finish":
             accepted = bool(d.get("accepted")); merged = bool(d.get("merged"))
+        elif ed == "agent_no_envelope":
+            transient = True                       # an agent produced no output — infra/model failure
     blocking = [] if accepted else _blocking(run_id)
-    return accepted, merged, run_id, blocking
+    return accepted, merged, run_id, blocking, transient
 
 
 def _target_of(item):
@@ -235,6 +238,8 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
     nt = notifier_mod.get_notifier()
     inflight: dict[str, tuple] = {}                    # item_id -> (live subprocess, its bindings)
     merge_retries: dict[str, int] = {}
+    infra_retries: dict[str, int] = {}                 # transient (model overloaded / no envelope) retries
+    retry_after: dict[str, float] = {}                 # item_id -> monotonic time before which not to redispatch
     conflicts = 0                                      # merge-conflict feedback (should stay near zero)
     # A prior daemon may have died mid-flight; systemd's cgroup kill takes its children too, so any
     # in_progress item is stale — reset it to ready so it re-runs cleanly.
@@ -254,13 +259,26 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
             item = by_id.get(iid)
             if not item:
                 continue
-            accepted, merged, run_id, blocking = _verdict(_target_of(item))
+            accepted, merged, run_id, blocking, transient = _verdict(_target_of(item))
             item["run_id"] = run_id
             if accepted and merged:
                 item["status"] = "accepted"
                 print(f"  ✓ accepted  {iid}", flush=True)
                 nt.accepted(project=item.get("repo", "—"), item_id=iid, kind=item["kind"],
                             note=item.get("note", ""), run_id=run_id)
+            elif (not accepted) and transient:           # infra failure (model overloaded / no envelope)
+                n = infra_retries.get(iid, 0) + 1; infra_retries[iid] = n
+                if n <= 5:
+                    item["status"] = "ready"             # NOT a human escalation — just try again, backed off
+                    back = min(60 * n, 600)
+                    retry_after[iid] = time.monotonic() + back
+                    print(f"  ↻ retry     {iid}  (transient infra failure, attempt {n}, backoff {back}s)", flush=True)
+                else:
+                    item["status"] = "escalated"
+                    escalate(item, run_id, ["repeated transient infra failure (model overloaded / no envelope)"])
+                    nt.escalation(project=item.get("repo", "—"), item_id=iid, kind=item["kind"],
+                                  note=item.get("note", ""), run_id=run_id, blocking=["repeated infra failure"])
+                    print(f"  ⚑ escalated {iid}  (infra x{n} — needs a look)", flush=True)
             elif accepted and not merged:                # lost the merge race on a moving base (I11)
                 conflicts += 1                           # decomposition-gate feedback signal
                 n = merge_retries.get(iid, 0) + 1; merge_retries[iid] = n
@@ -291,6 +309,8 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
                 break
             if item["id"] in inflight:
                 continue
+            if retry_after.get(item["id"], 0) > time.monotonic():
+                continue                               # backing off a transient failure — not yet due
             b = _bindings(item)
             if any(_overlaps(b, h) for h in held):
                 print(f"  ⋯ hold      {item['id']}  (bindings {sorted(b)} overlap in-flight — serialized)", flush=True)
