@@ -17,7 +17,9 @@ the technical work itself — authoring migrations/canon the builder can't — a
 business/product decisions** to the human. Auth is durable (single-refresher broker), access is durable (Tailscale
 tailnet), GitHub is origin of truth.
 
-**Right now:** JRN-S4 + JRN-B1 are `in_progress` (building in parallel).
+**Right now:** JRN-S4 + JRN-B1 are `ready`, and the daemon is deliberately HOLDING dispatch — the
+cross-family reviewer's OpenAI account is rate-limited (`usage_limit_reached`), and the factory no
+longer builds what it cannot get judged. It re-probes every 30 min and resumes on its own.
 
 ---
 
@@ -66,7 +68,20 @@ tailnet), GitHub is origin of truth.
    (`canon.py:bindings`, `orchestrator._bindings/_overlaps`); parks escalations & keeps going; re-queues merge-race
    losers (I11) and **transient infra failures** (Anthropic `overloaded_error`) with backoff — only persistent
    failures escalate. `ops/arxus-factory.service`.
-6. **Factory Brief console** (Artifact, plain-language status/decisions): https://claude.ai/code/artifact/dc2e9fcd-8fec-4140-910f-11b3d21f23bd
+6. **Provider failures are infra, not findings (2026-08-18, `26c8da1` + `d31de6a`).** A rate-limited
+   provider emits no envelope; the lane turned that into the synthetic blocking finding "no review
+   envelope" and sent the builder to close it — both parallel journeys burned 3 fix iterations × 4
+   architect rounds against a reviewer that could not answer. Now: `omp._parse_stream` captures the
+   provider's own error + the cooldown it advertises; `AgentResult.infra_failed` separates a downed
+   provider from a model that garbled its envelope (still re-promptable); `PhaseUnavailable` stops
+   the run at the failing phase (any role on provider failure, the reviewer on ANY missing envelope
+   — acceptance is then undecidable); the daemon re-queues honoring the advertised cooldown
+   (`max(schedule, cooldown)`, capped 1h). And `JudgeGate` PREFLIGHTS the reviewer's family before
+   dispatch (`omp.probe` — free when down, a fraction of a cent when up, healthy verdict cached
+   10 min), so a build is never spent on work no reviewer can certify. Fail-open throughout: only an
+   explicit provider error holds anything. Regression: `control-plane/selftest_k1.py` asserts against
+   the two recorded outage streams in `control-plane/fixtures/`.
+7. **Factory Brief console** (Artifact, plain-language status/decisions): https://claude.ai/code/artifact/dc2e9fcd-8fec-4140-910f-11b3d21f23bd
    (hand-populated snapshot; regenerate as state changes).
 
 ## ARXUS PRODUCT STATE
@@ -74,7 +89,9 @@ Repo `…/arxus` `main` = **898e9d5**. **Shipped (built + reviewer-accepted + me
 schema migrations **0001→0010** (all apply clean), auth foundation, **JRN-S1** (valuation), **JRN-S3** (exit-readiness),
 **JRN-S2** (published live listing — resolved autonomously by the architect: migrations 0007/0008/0009 + DEC-060),
 **JRN-B3** (NDA→tiered docs — migrations 0004/0005/0006), **jurisdiction gate** (data-driven over the seeded set).
-- **In flight now:** JRN-S4 (edit/version), JRN-B1 (buyer BQS) — building in parallel.
+- **Queued (ready):** JRN-S4 (edit/version), JRN-B1 (buyer BQS). Both got a full architect resolution
+  on 2026-08-18 and each surfaced a REAL business decision awaiting Christian (see below); the builds
+  themselves never reached a verdict because the reviewer's family was rate-limited.
 - **Not started (~15 journeys):** S5, B2, B4, T1/T2, N1/N2, M1, J1, F1, X1, BR1, G1/G2, AI1, P1 — the bulk of the product.
 - **Detailed state lives in the repo:** `canon/Decision Log.md` (DEC-052→061), `Canonical Journeys v2.md`,
   `Acceptance Criteria v2.md`, `backlog.yml`.
@@ -94,6 +111,16 @@ calls trigger `overloaded_error`; that's why N=2 today).
 ---
 
 ## OPEN DECISIONS (awaiting the human — non-blocking launch gates)
+- **DEC-062 (JRN-S4) — what does a seller's "stage" mean?** The architect built the mechanism against a
+  provisional financing ladder (no financing = 1 → 30%+ fully specified with standby = 4), marked
+  unratified everywhere including inside each recorded stage change. Ratify it, give different
+  thresholds, or say stage means something else (e.g. deal progress) — in which case AC-S4-03's
+  financing trigger is the wrong driver. Also: should a seller's self-asserted sign-up stage be
+  re-scored by the ladder? (Architect recommends yes.) Brief: the run dir's `human_brief.md`.
+- **JRN-B1 — verification vendors + FCRA disclosure.** Which identity/credit/background vendors we sign
+  (recommended: Plaid + a bureau soft-pull + Checkr) and who supplies the FCRA soft-pull disclosure.
+  Credit-tier checks stay switched OFF until a real disclosure exists; unavailable checks show as
+  unavailable rather than faked. Contract/cost/compliance call, no code waits on it.
 - **OPEN-JUR1** — one pre-launch legal green-light on the jurisdiction set as a whole (DEC-061). Seed populated
   (49 live / CA,NY defer_and_structure / 0 excluded), planning-grade until this sign-off. Not per-state.
 - **OPEN-VAL1** — ratify the valuation benchmark table before real sellers (DEC-052).
@@ -115,8 +142,10 @@ These do NOT block building; they gate production exposure. The factory surfaces
   VPS jump host (register a VPS-held key with `ssh-key add`).
 - **Anthropic OAuth is rotating** — never let two machines hold the same creds. Broker = sole refresher.
 - **The VPS backlog.yml is live runtime state** (daemon-mutated) → shows git-dirty on the VPS; that's expected.
-- **One subscription rate-limits concurrency** — `overloaded_error` under parallel opus-5; daemon retries transient
-  failures with backoff. Real scale = account-pool and/or exe.dev.
+- **BOTH families have a single-account ceiling** — Anthropic `overloaded_error` under parallel opus-5,
+  and the OpenAI reviewer hits `usage_limit_reached` (a multi-hour window, not the 30 min it advertises).
+  The daemon now backs off and preflights instead of burning builds, but the factory simply STOPS
+  producing while the judge family is out. The account-pool must cover BOTH families, not just Anthropic.
 - **Migrations are a protected path** — only the architect (or human) authors them; the builder gets a remediation brief.
 - **Auto-mode may block some VPS file-writes/secret-writes over SSH** — deploy via copy-paste blocks or a permission rule.
 - **Rotate keys pasted in chat** (Tailscale API/auth keys, the broker token) when convenient.
