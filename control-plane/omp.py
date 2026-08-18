@@ -168,6 +168,32 @@ def _child_env() -> dict[str, str]:
     return env
 
 
+def probe(role_name: str, timeout_s: int = 90) -> tuple[bool, float, str]:
+    """Is this role's PROVIDER answering at all? One trivial completion, no system prompt, no tools.
+
+    Not a judgment about the model — just whether the family is reachable. A rate-limited provider
+    fails this instantly and for free, which is the point: the factory otherwise spends a full build
+    (planner + builder + test-author, the expensive family) before discovering that the cross-family
+    reviewer cannot judge it, and everything built is unusable until the judge comes back.
+
+    Fail-open by construction: only an explicit provider error reports unavailable. A probe that
+    times out, crashes, or answers oddly reports AVAILABLE, so a broken check can never park the
+    queue — the worst case is the old behavior."""
+    r = config.role(role_name)
+    argv = [config.OMP_BIN, "-p", "--mode", "json", "--no-title", "--model", r.model]
+    try:
+        proc = subprocess.run(argv, input="Reply with the single word OK.", capture_output=True,
+                              text=True, timeout=timeout_s, env=_child_env())
+    except Exception:
+        return True, 0.0, ""
+    _sid, final, _cost, _n, provider_error, retry_after_s = _parse_stream(proc.stdout.splitlines())
+    if final:                                  # it answered — up, whatever else the stream said
+        return True, 0.0, ""
+    if provider_error:
+        return False, retry_after_s, provider_error
+    return True, 0.0, ""
+
+
 def run(call: E.AgentCall, run_dir: Path, workspace: Path, tracer=None) -> AgentResult:
     """Invoke one bounded OMP phase. `workspace` is the repo the agent operates in (its cwd)."""
     r = config.role(call.role)

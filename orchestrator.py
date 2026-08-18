@@ -31,8 +31,10 @@ sys.path.insert(0, str(CP))
 import obsdb
 import notifier as notifier_mod
 import canon
+import omp
 
 DONE = {"accepted", "done"}
+JUDGE_PROBE_TTL = 600      # seconds a healthy judge-provider probe is trusted before re-checking
 LANE = str(FACTORY_ROOT / "lanes" / "feature.py")
 
 
@@ -213,6 +215,43 @@ def _target_of(item):
     return item["id"] if item["kind"] == "foundation" else item.get("journey", item["id"])
 
 
+# --- provider preflight: never spend a build the judge family cannot certify ----------------------
+class JudgeGate:
+    """Holds dispatch while the cross-family reviewer's provider is down.
+
+    A build is only worth what an independent reviewer can sign off, so dispatching into a
+    rate-limited judge family produces nothing usable — on 2026-08-18 that was a full 40-minute
+    Anthropic build per attempt against an exhausted OpenAI account, five attempts deep. The probe
+    is a single trivial completion: a fraction of a cent when the family is up, free when it is
+    down (a rate limit errors immediately). Healthy verdicts are cached for `ttl` so a busy queue
+    is not probing every poll; an unhealthy one parks dispatch for the cooldown the provider itself
+    advertised, floored at 5 minutes and capped at an hour."""
+    def __init__(self, probe=None, ttl=JUDGE_PROBE_TTL, clock=time.monotonic, log=print):
+        self._probe = probe or (lambda: omp.probe("reviewer"))
+        self._ttl, self._clock, self._log = ttl, clock, log
+        self._ok_until = self._hold_until = 0.0
+
+    def ready(self) -> bool:
+        now = self._clock()
+        if now < self._hold_until:
+            return False
+        if now < self._ok_until:
+            return True
+        try:
+            ok, wait, err = self._probe()
+        except Exception as ex:                        # a check that breaks must not stop the factory
+            self._log(f"  ⋯ judge preflight failed ({ex}) — dispatching anyway", flush=True)
+            self._ok_until = now + self._ttl
+            return True
+        if ok:
+            self._ok_until = now + self._ttl
+            return True
+        self._hold_until = now + min(max(wait, 300), 3600)
+        self._log(f"  ⋯ hold      dispatch — reviewer provider unavailable, nothing built now could "
+                  f"be judged ({err[:70]}); re-probing in {int(self._hold_until - now)}s", flush=True)
+        return False
+
+
 # --- decomposition gate (Rev4 §9): only parallelize streams with disjoint artifact bindings -------
 _WILDCARD = frozenset({"*"})                       # unknown scope → conflicts with everything → serial
 
@@ -245,6 +284,7 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
     inflight: dict[str, tuple] = {}                    # item_id -> (live subprocess, its bindings)
     merge_retries: dict[str, int] = {}
     infra_retries: dict[str, int] = {}                 # transient (model overloaded / no envelope) retries
+    judge = JudgeGate()                                # preflight: is the reviewer family up?
     retry_after: dict[str, float] = {}                 # item_id -> monotonic time before which not to redispatch
     conflicts = 0                                      # merge-conflict feedback (should stay near zero)
     # A prior daemon may have died mid-flight; systemd's cgroup kill takes its children too, so any
@@ -315,7 +355,12 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
         # conflicting run to finish — instead of racing to a merge conflict. This is what makes it
         # the designed `allocate` step rather than a naive parallel loop.
         held = [b for (_p, b) in inflight.values()]    # bindings currently in flight
-        for item in ready(items):
+        dispatchable = [i for i in ready(items) if i["id"] not in inflight
+                        and retry_after.get(i["id"], 0) <= time.monotonic()]
+        # Nothing is dispatched while the judge family is down — a build that cannot be reviewed is
+        # spend with no possible outcome. Checked only when there is actually something to dispatch.
+        for item in (dispatchable if (dispatchable and len(inflight) < max_parallel
+                                      and judge.ready()) else []):
             if len(inflight) >= max_parallel:
                 break
             if item["id"] in inflight:
