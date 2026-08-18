@@ -31,32 +31,39 @@ check("fenced", '{"a":1}' in omp._json_slice('here:\n```json\n{"a":1}\n```\n'))
 check("prose-wrapped", omp._json_slice('done {"x":2} ok').strip() == '{"x":2}')
 
 # 2. review stream -> ReviewOutput (clean bare JSON final message)
-print("review-phase.jsonl -> ReviewOutput:")
-lines = (RUN / "review-phase.jsonl").read_text().splitlines()
-sid, final, cost, n, perr, wait = omp._parse_stream(lines)
-check("session id present", bool(sid), sid or "")
-check("events counted", n > 100, f"{n} events")
-check("cost captured", cost > 0, f"${cost:.4f}")
-check("healthy stream flags no provider error", not perr and wait == 0.0)
-rv = E.ReviewOutput.model_validate_json(omp._json_slice(final))
-check("validates ReviewOutput", rv.status == "success")
-check("approved is bool", isinstance(rv.approved, bool), f"approved={rv.approved}")
-check("has blocking finding", any(f.severity == "blocking" for f in rv.findings),
-      f"{len(rv.findings)} findings")
+# The P0 recording lives under gitignored runs/, so it is present on the machine that made it and
+# absent on a fresh clone (the VPS). Skip those sections there rather than crashing — the checks
+# that ship their own fixtures must still run everywhere.
+HAVE_P0 = (RUN / "review-phase.jsonl").exists() and (RUN / "build-fix2.jsonl").exists()
+if not HAVE_P0:
+    print(f"P0 recording absent ({RUN.name}) — skipping the replay-stream sections")
+if HAVE_P0:
+    print("review-phase.jsonl -> ReviewOutput:")
+    lines = (RUN / "review-phase.jsonl").read_text().splitlines()
+    sid, final, cost, n, perr, wait = omp._parse_stream(lines)
+    check("session id present", bool(sid), sid or "")
+    check("events counted", n > 100, f"{n} events")
+    check("cost captured", cost > 0, f"${cost:.4f}")
+    check("healthy stream flags no provider error", not perr and wait == 0.0)
+    rv = E.ReviewOutput.model_validate_json(omp._json_slice(final))
+    check("validates ReviewOutput", rv.status == "success")
+    check("approved is bool", isinstance(rv.approved, bool), f"approved={rv.approved}")
+    check("has blocking finding", any(f.severity == "blocking" for f in rv.findings),
+          f"{len(rv.findings)} findings")
 
-# 3. build stream -> BuildOutput (final envelope after tool calls)
-print("build-fix2.jsonl -> BuildOutput:")
-bl = (RUN / "build-fix2.jsonl").read_text().splitlines()
-bsid, bfinal, bcost, bn, _bperr, _bwait = omp._parse_stream(bl)
-check("session id present", bool(bsid), bsid or "")
-if bfinal.strip().startswith("{") or "{" in bfinal:
-    try:
-        bo = E.BuildOutput.model_validate_json(omp._json_slice(bfinal))
-        check("validates BuildOutput", bo.status in ("success", "fail"))
-    except Exception as ex:
-        check("validates BuildOutput", False, str(ex)[:80])
-else:
-    check("build final present", False, "no JSON final (timed-out phase) — expected for some")
+    # 3. build stream -> BuildOutput (final envelope after tool calls)
+    print("build-fix2.jsonl -> BuildOutput:")
+    bl = (RUN / "build-fix2.jsonl").read_text().splitlines()
+    bsid, bfinal, bcost, bn, _bperr, _bwait = omp._parse_stream(bl)
+    check("session id present", bool(bsid), bsid or "")
+    if bfinal.strip().startswith("{") or "{" in bfinal:
+        try:
+            bo = E.BuildOutput.model_validate_json(omp._json_slice(bfinal))
+            check("validates BuildOutput", bo.status in ("success", "fail"))
+        except Exception as ex:
+            check("validates BuildOutput", False, str(ex)[:80])
+    else:
+        check("build final present", False, "no JSON final (timed-out phase) — expected for some")
 
 # 4. provider-failure classification: a rate limit / overload is INFRA, not a review finding.
 #    Recorded from the 2026-08-18 outage, where a rate-limited reviewer was turned into the
