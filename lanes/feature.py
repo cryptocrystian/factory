@@ -31,6 +31,11 @@ from canon import CanonResolver
 from session import Run
 
 
+class ReplayGap(Exception):
+    """The recording has no stream for a role the lane reached. Replay is a regression over a
+    RECORDED path; a role that never ran when the recording was made cannot be replayed."""
+
+
 class PhaseUnavailable(Exception):
     """A phase produced no output for a reason no amount of building can fix, so the run must STOP
     rather than fabricate work. Two cases:
@@ -98,6 +103,9 @@ class ReplayRunner:
         self.rec = Path(rec_dir)
 
     def run(self, call: E.AgentCall, run: Run, workspace: Path):
+        if call.role not in self.MAP:
+            raise ReplayGap(f"no recorded stream for role {call.role!r} in {self.rec.name} — "
+                            f"replay covers {sorted(self.MAP)}")
         lines = (self.rec / self.MAP[call.role]).read_text().splitlines()
         sid, final, cost, n, _perr, _wait = omp._parse_stream(lines)
         env = E.ENVELOPE_TYPES[call.output_type].model_validate_json(omp._json_slice(final))
@@ -166,7 +174,11 @@ class Lane:
         # architect — the authority over those paths — takes over: it resolves technical findings
         # against canon and escalates only genuine business/product decisions. This is what closes
         # the governance loop so a human is not the trigger.
-        if not accepted:
+        # Live only. The architect is the authority path over protected files; replay feeds recorded
+        # envelopes and has no architect stream to feed it, so entering the loop here would crash the
+        # regression rather than test it — which is exactly what it did until 2026-08-19, leaving the
+        # only zero-cost end-to-end check un-runnable from the day the architect was added.
+        if not accepted and self.live:
             accepted = self._architect_resolve(run)
         return run.finish(accepted, reason="" if accepted else self._escalation_reason())
 
