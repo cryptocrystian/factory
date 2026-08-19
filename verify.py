@@ -214,6 +214,23 @@ def verify_governance() -> None:
     check("pm_unavailable" in dets(r), "an unavailable PM is recorded as such")
 
 
+def verify_ladder_coverage() -> None:
+    """Every entry point must climb the same ladder: builder -> architect -> PM -> owner.
+    Until 2026-08-19 only journeys did; foundations and remediations escalated straight to a human."""
+    import ast
+    tree = ast.parse((ROOT / "lanes" / "feature.py").read_text())
+    lane = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "Lane")
+    fns = {n.name: n for n in lane.body if isinstance(n, ast.FunctionDef)}
+    for entry, body_fn in (("journey", "_feature_phases"), ("foundation", "_foundation_phases"),
+                           ("remediate", "remediate")):
+        src = ast.dump(fns[body_fn]) if body_fn in fns else ""
+        check("_architect_resolve" in src, f"{entry} lane climbs the escalation ladder")
+    # and the ladder itself has exactly one unresolved exit, so the PM cannot be bypassed
+    ar = ast.dump(fns["_architect_resolve"])
+    check(ar.count("_unresolved") >= 2 and "'False'" not in ar.split("_unresolved")[0][-40:],
+          "the architect loop has no exit that skips the PM")
+
+
 def verify_selftest() -> None:
     rc, out = run(["uv", "run", str(ROOT / "control-plane" / "selftest_k1.py")])
     check(rc == 0 and "ALL PASS" in out, "K1 adapter-spine self-test",
@@ -242,6 +259,7 @@ def main(argv: list[str]) -> int:
     verify_config()
     verify_selftest()
     verify_governance()
+    verify_ladder_coverage()
     verify_replay(repo)
     if a.with_docker:
         verify_docker(repo)

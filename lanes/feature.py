@@ -187,13 +187,20 @@ class Lane:
     def remediate(self, findings: str) -> bool:
         """Close open review findings on an already-built journey, via the bounded fix loop."""
         run = Run(self.repo, lane="remediate", target=self.journey)
+        self._agent_gates_ok = True
+        self._human_brief = None
         run.tracer.log(event_detail="remediate_start", journey=self.journey)
         (run.dir / "context.md").write_text(CanonResolver(self.repo).resolve(self.journey).markdown())
         try:
             accepted = self._converge(run, [findings], "")
+            # The ladder is the same for every kind of work: builder, then the architect over
+            # protected paths, then the PM over product calls, and only then a human. Without this
+            # a remediation escalated to the owner having consulted neither.
+            if not accepted:
+                accepted = self._architect_resolve(run)
         except PhaseUnavailable as e:
             return self._abort(run, e)
-        return run.finish(accepted, reason="" if accepted else "did not converge")
+        return run.finish(accepted, reason="" if accepted else self._escalation_reason())
 
     def foundation(self, brief: str) -> bool:
         """Build a foundation (auth, infra…) from a brief instead of a canon journey — same machinery.
@@ -221,7 +228,9 @@ class Lane:
         accepted = l0_ok and unit_ok[0] and approved and self._agent_gates_ok
         if not accepted:
             accepted = self._converge(run, findings, unit_ok[1])
-        return run.finish(accepted, reason="" if accepted else "did not converge")
+        if not accepted:
+            accepted = self._architect_resolve(run)      # same ladder as a journey (see remediate)
+        return run.finish(accepted, reason="" if accepted else self._escalation_reason())
 
     def _abort(self, run, e: PhaseUnavailable) -> bool:
         """End the run on an undecidable phase. NOT an escalation: there is no ruling for a human to
