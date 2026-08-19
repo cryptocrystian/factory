@@ -89,5 +89,22 @@ behaved = omp.AgentResult(ok=False, envelope=None, session_id="s", cost_usd=0.0,
                           events=9, raw_final="not json", error="envelope parse failed")
 check("parse failure is not infra", not behaved.infra_failed)
 
+# 5. the provider fallback chain: a paid second route to the same judgment (2026-08-18).
+print("provider fallback chain:")
+import config
+chain = config.model_chain('reviewer')
+check("reviewer keeps its subscription model first", chain[0] == config.role('reviewer').model, chain[0])
+check("reviewer has a fallback route", len(chain) > 1, " -> ".join(chain[1:]) or "none")
+check("cross-family independence survives the reroute",
+      all('openai' in m or 'gpt' in m for m in chain),
+      "reviewer stays OpenAI-family, billed differently")
+check("builder is not rerouted", config.model_chain('builder') == (config.role('builder').model,))
+import os
+os.environ['OMP_FALLBACK_REVIEWER'] = ''
+check("a fallback can be switched off by env", config.model_chain('reviewer') == (config.role('reviewer').model,))
+os.environ['OMP_FALLBACK_REVIEWER'] = 'openrouter/x/y'
+check("a fallback can be redirected by env", config.model_chain('reviewer')[-1] == 'openrouter/x/y')
+del os.environ['OMP_FALLBACK_REVIEWER']
+
 print("\nK1 adapter-spine self-test:", "ALL PASS" if ok else "FAILURES")
 sys.exit(0 if ok else 1)

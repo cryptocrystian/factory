@@ -247,8 +247,9 @@ class JudgeGate:
             self._ok_until = now + self._ttl
             return True
         self._hold_until = now + min(max(wait, 300), 3600)
-        self._log(f"  ⋯ hold      dispatch — reviewer provider unavailable, nothing built now could "
-                  f"be judged ({err[:70]}); re-probing in {int(self._hold_until - now)}s", flush=True)
+        self._log(f"  ⋯ hold      dispatch — no judge route available (subscription and fallback both "
+                  f"down), nothing built now could be judged ({err[:70]}); "
+                  f"re-probing in {int(self._hold_until - now)}s", flush=True)
         return False
 
 

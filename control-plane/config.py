@@ -23,6 +23,7 @@ class Role:
     system_md: str                               # path under agents/<role>/system.md
     output_type: str
     timeout_s: int = 900                         # per-call OMP wall-clock ceiling (I9), tuned per role
+    fallbacks: tuple[str, ...] = ()              # models tried, in order, when the primary's PROVIDER is down
 
 
 # OMP tool sets (verified names). Read-only = read,grep,glob; add write/edit/bash per role.
@@ -53,6 +54,41 @@ ROLES: dict[str, Role] = {
     "product-manager": Role("product-manager", "gpt-5.6-sol", "openai", "high",
                             _RO + ("write",), "product-manager/system.md", "architect", timeout_s=1200),
 }
+
+# --------------------------------------------------------------------------- provider fallbacks
+# WHY: every role that judges the build (test-author, reviewer) and the PM sit on ONE OpenAI Codex
+# subscription, and on 2026-08-18 its weekly quota ran out — with Anthropic at 40% used, the factory
+# still stopped dead, because a build nobody can review is worth nothing. The fix is not a second
+# subscription but a paid, uncapped SECOND ROUTE to the same judgment: OpenRouter, billed per token.
+#
+# The subscription is always tried first, so this costs nothing while quota is healthy; the fallback
+# is reached only when the primary's provider itself fails (a rate limit or an outage — never when
+# the model merely answered badly). Ids are overridable per role by env var, because an aggregator's
+# catalog moves faster than this file does.
+#
+# Cross-family independence (I3) is preserved BY MODEL, not by billing route: the reviewer's
+# fallback is still an OpenAI-family model, just reached through OpenRouter rather than Codex.
+_FALLBACK_DEFAULTS: dict[str, tuple[str, ...]] = {
+    "test-author":     ("openrouter/openai/gpt-5.6-sol",),
+    "reviewer":        ("openrouter/openai/gpt-5.6-terra",),
+    "product-manager": ("openrouter/openai/gpt-5.6-sol",),
+}
+
+
+def _fallbacks_for(role_name: str) -> tuple[str, ...]:
+    """Env override wins: OMP_FALLBACK_<ROLE> ("" disables the fallback, a comma-list replaces it)."""
+    key = "OMP_FALLBACK_" + role_name.upper().replace("-", "_")
+    raw = os.environ.get(key)
+    if raw is None:
+        return _FALLBACK_DEFAULTS.get(role_name, ())
+    return tuple(m.strip() for m in raw.split(",") if m.strip())
+
+
+def model_chain(role_name: str) -> tuple[str, ...]:
+    """The models to try for a role, primary first. One entry unless a fallback is configured."""
+    r = role(role_name)
+    return (r.model,) + tuple(m for m in _fallbacks_for(role_name) if m and m != r.model)
+
 
 # Per-role repo write grant (I6), enforced post-hoc by permissions.py. None=unrestricted, []=read-only.
 WRITE_GRANTS: dict[str, list[str] | None] = {

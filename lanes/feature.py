@@ -51,22 +51,40 @@ class PhaseUnavailable(Exception):
 # ----------------------------------------------------------------------------- runners
 class LiveRunner:
     """Drive OMP; on a mid-phase timeout, resume the same session — bounded by BOTH a retry count and a
-    per-phase wall-clock cap (I9), so a phase that can't converge escalates instead of churning."""
+    per-phase wall-clock cap (I9), so a phase that can't converge escalates instead of churning.
+
+    When the PROVIDER itself is down (rate limit, outage) no amount of resuming helps, so the phase
+    is re-attempted on the role's fallback models instead — same role, same system prompt, same
+    tools, a different route to the same judgment. The subscription is always position one, so the
+    paid route is reached only when the free one has actually failed."""
     def run(self, call: E.AgentCall, run: Run, workspace: Path):
+        chain = config.model_chain(call.role)
+        res = self._attempt(call, run, workspace, model=None)
+        for fallback in chain[1:]:
+            if not res.infra_failed:
+                break
+            run.tracer.log(event_detail="provider_fallback", role=call.role,
+                           from_model=chain[0], to_model=fallback, error=res.error)
+            res = self._attempt(replace_call(call, resume_session=None), run, workspace, model=fallback)
+            if res.ok:
+                run.tracer.log(event_detail="provider_fallback_ok", role=call.role, model=fallback)
+        return res
+
+    def _attempt(self, call: E.AgentCall, run: Run, workspace: Path, model: str | None):
         budget = config.Budget()
         start = time.monotonic()
-        res = omp.run(call, run.dir, workspace, run.tracer)
+        res = omp.run(call, run.dir, workspace, run.tracer, model=model)
         tries = 0
         while (res.timed_out or not res.ok) and tries < budget.max_retries_per_phase:
-            if not res.session_id:
-                break
+            if not res.session_id or res.infra_failed:
+                break                                      # resuming into a downed provider is pointless
             elapsed = time.monotonic() - start
-            if elapsed > budget.max_wall_s:                 # per-phase wall cap: give up, let the lane escalate
+            if elapsed > budget.max_wall_s:                # per-phase wall cap: give up, let the lane escalate
                 run.tracer.log(event_detail="phase_wall_exceeded", role=call.role,
                                elapsed_s=int(elapsed), max_wall_s=budget.max_wall_s)
                 break
             call = replace_call(call, resume_session=res.session_id)
-            res = omp.run(call, run.dir, workspace, run.tracer)
+            res = omp.run(call, run.dir, workspace, run.tracer, model=model)
             tries += 1
         return res
 

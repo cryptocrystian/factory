@@ -55,10 +55,10 @@ class AgentResult:
         return (not self.ok) and bool(self.provider_error)
 
 
-def _argv(call: E.AgentCall, r: config.Role, session_dir: Path) -> list[str]:
+def _argv(call: E.AgentCall, r: config.Role, session_dir: Path, model: str | None = None) -> list[str]:
     argv = [
         config.OMP_BIN, "-p", "--mode", "json", "--no-title",
-        "--model", r.model, "--thinking", r.thinking,
+        "--model", model or r.model, "--thinking", r.thinking,
         "--system-prompt", str(config.AGENTS_DIR / r.system_md),
         "--no-skills", "--no-rules", "--no-extensions", "--auto-approve",
         "--tools", ",".join(r.tools),
@@ -138,12 +138,51 @@ def _broker_env_candidates() -> tuple[str, ...]:
     )
 
 
+# Pay-per-token provider keys (OpenRouter today) live beside the broker env, same discipline:
+# a file on the box, never a repo, never an argv. They are the FALLBACK path — the subscription
+# is always tried first, so nothing here is spent while quota is healthy.
+_PROVIDER_KEY_PREFIXES = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY")
+
+
+def _provider_env_candidates() -> tuple[str, ...]:
+    return (
+        os.environ.get("OMP_PROVIDER_ENV_FILE", ""),
+        str(Path.home() / ".omp" / "providers.env"),
+        "/root/.omp/providers.env",
+    )
+
+
+def _load_provider_keys(env: dict[str, str]) -> None:
+    """Add any provider API keys the host holds, without overriding what the parent already set.
+    Fail-open exactly like the broker loader: an unreadable file leaves the environment alone."""
+    for cand in _provider_env_candidates():
+        if not cand:
+            continue
+        try:
+            p = Path(cand)
+            if not p.is_file():
+                continue
+            text = p.read_text()
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            if k in _PROVIDER_KEY_PREFIXES:
+                env.setdefault(k, v.strip())
+        break
+
+
 def _child_env() -> dict[str, str]:
     """Env for spawned omp: inherit the parent, then ensure broker vars are present if a
     broker-env file exists and the parent hasn't already set them. Fail-open: any read/stat error
     (missing file, or a path we can't even stat as this user) leaves the environment untouched —
     the child falls back to whatever local auth it has."""
     env = dict(os.environ)
+    _load_provider_keys(env)
     if env.get("OMP_AUTH_BROKER_URL"):
         return env                                  # parent already points at a broker; respect it
     for cand in _broker_env_candidates():
@@ -180,26 +219,37 @@ def probe(role_name: str, timeout_s: int = 90) -> tuple[bool, float, str]:
     times out, crashes, or answers oddly reports AVAILABLE, so a broken check can never park the
     queue — the worst case is the old behavior."""
     r = config.role(role_name)
-    argv = [config.OMP_BIN, "-p", "--mode", "json", "--no-title", "--model", r.model]
-    try:
-        proc = subprocess.run(argv, input="Reply with the single word OK.", capture_output=True,
-                              text=True, timeout=timeout_s, env=_child_env())
-    except Exception:
-        return True, 0.0, ""
-    _sid, final, _cost, _n, provider_error, retry_after_s = _parse_stream(proc.stdout.splitlines())
-    if final:                                  # it answered — up, whatever else the stream said
-        return True, 0.0, ""
-    if provider_error:
-        return False, retry_after_s, provider_error
-    return True, 0.0, ""
+    worst_wait, worst_err = 0.0, ""
+    # The role is available if ANY model in its chain answers: the subscription first (free at the
+    # margin), then the paid fallback. Reporting the role down while a fallback is live would idle
+    # the factory for no reason.
+    for model in config.model_chain(role_name):
+        argv = [config.OMP_BIN, "-p", "--mode", "json", "--no-title", "--model", model]
+        try:
+            proc = subprocess.run(argv, input="Reply with the single word OK.", capture_output=True,
+                                  text=True, timeout=timeout_s, env=_child_env())
+        except Exception:
+            return True, 0.0, ""               # a broken probe never parks the queue
+        _sid, final, _cost, _n, provider_error, retry_after_s = _parse_stream(proc.stdout.splitlines())
+        if final:                              # it answered — up, whatever else the stream said
+            return True, 0.0, ""
+        if not provider_error:
+            return True, 0.0, ""               # no answer, no provider complaint → not our call
+        worst_wait = max(worst_wait, retry_after_s)
+        worst_err = worst_err or f"{model}: {provider_error}"
+    return False, worst_wait, worst_err
 
 
-def run(call: E.AgentCall, run_dir: Path, workspace: Path, tracer=None) -> AgentResult:
-    """Invoke one bounded OMP phase. `workspace` is the repo the agent operates in (its cwd)."""
+def run(call: E.AgentCall, run_dir: Path, workspace: Path, tracer=None,
+        model: str | None = None) -> AgentResult:
+    """Invoke one bounded OMP phase. `workspace` is the repo the agent operates in (its cwd).
+
+    `model` overrides the role's primary model — used for the fallback chain, so a rate-limited
+    subscription can hand the same role, same system prompt and same tools to a paid provider."""
     r = config.role(call.role)
     session_dir = run_dir / "sessions" / call.role
     session_dir.mkdir(parents=True, exist_ok=True)
-    argv = _argv(call, r, session_dir)
+    argv = _argv(call, r, session_dir, model)
 
     timed_out = False
     # Spawn in a new session so the whole process tree can be reaped on timeout (start_new_session).
@@ -218,7 +268,8 @@ def run(call: E.AgentCall, run_dir: Path, workspace: Path, tracer=None) -> Agent
             out = ""
 
     lines = out.splitlines()
-    (run_dir / f"{call.role}.jsonl").write_text(out)
+    suffix = "" if model in (None, r.model) else f".{model.replace('/', '_')}"
+    (run_dir / f"{call.role}{suffix}.jsonl").write_text(out)
     session_id, final_text, cost, n, provider_error, retry_after_s = _parse_stream(lines)
     if tracer:
         tracer.record_call(call.role, n, cost, timed_out)
