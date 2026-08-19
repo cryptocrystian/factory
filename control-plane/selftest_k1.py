@@ -95,6 +95,9 @@ import config
 chain = config.model_chain('reviewer')
 check("reviewer keeps its subscription model first", chain[0] == config.role('reviewer').model, chain[0])
 check("reviewer has a fallback route", len(chain) > 1, " -> ".join(chain[1:]) or "none")
+check("the direct vendor route precedes any aggregator",
+      all(not m.startswith('openrouter/') for m in chain[:-1]) and 'openrouter/' in chain[-1],
+      "fewer parties see the diff on the route we actually use")
 check("cross-family independence survives the reroute",
       all('openai' in m or 'gpt' in m for m in chain),
       "reviewer stays OpenAI-family, billed differently")

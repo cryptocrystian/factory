@@ -68,10 +68,17 @@ ROLES: dict[str, Role] = {
 #
 # Cross-family independence (I3) is preserved BY MODEL, not by billing route: the reviewer's
 # fallback is still an OpenAI-family model, just reached through OpenRouter rather than Codex.
+# ORDER IS A PRIVACY DECISION, not just a price one. The judge reads repo diffs, so the fewer
+# parties in that path the better: the direct OpenAI API is the same vendor we already trust with
+# this traffic via Codex, while an aggregator is an additional hop that may log. OpenRouter's
+# per-request privacy controls (`provider.zdr`, `provider.data_collection`) cannot help here —
+# they live in the request body, which omp builds and exposes no way to set — and its account-level
+# data policy is dashboard-only, with no API. So OpenRouter sits LAST: a real route, reached only
+# when both OpenAI paths are down, and removable entirely with OMP_FALLBACK_<ROLE>.
 _FALLBACK_DEFAULTS: dict[str, tuple[str, ...]] = {
-    "test-author":     ("openrouter/openai/gpt-5.6-sol",),
-    "reviewer":        ("openrouter/openai/gpt-5.6-terra",),
-    "product-manager": ("openrouter/openai/gpt-5.6-sol",),
+    "test-author":     ("openai/gpt-5.6-sol",   "openrouter/openai/gpt-5.6-sol"),
+    "reviewer":        ("openai/gpt-5.6-terra", "openrouter/openai/gpt-5.6-terra"),
+    "product-manager": ("openai/gpt-5.6-sol",   "openrouter/openai/gpt-5.6-sol"),
 }
 
 
