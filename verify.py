@@ -235,6 +235,61 @@ def verify_ladder_coverage() -> None:
           "the architect loop has no exit that skips the PM")
 
 
+def verify_daemon() -> None:
+    """The continuous loop's own logic: it must hold when no judge can run, sit out a provider's
+    advertised cooldown rather than retrying inside it, and never park the queue on a broken check."""
+    import importlib.util as _il
+    spec = _il.spec_from_file_location("orch_v", ROOT / "orchestrator.py")
+    orch = _il.module_from_spec(spec)
+    spec.loader.exec_module(orch)
+
+    t = [0.0]
+    probes = []
+
+    def gate(probe):
+        return orch.JudgeGate(probe=probe, ttl=600, clock=lambda: t[0], log=lambda *a, **k: None)
+
+    # a healthy judge is probed once, not every poll
+    t[0] = 0.0
+    g = gate(lambda: (probes.append(1), (True, 0.0, ""))[1])
+    ok = all(g.ready() for _ in range(20))
+    check(ok and len(probes) == 1, "a healthy judge is probed once per TTL, not every poll",
+          f"{len(probes)} probe(s) across 20 polls")
+
+    # a downed judge holds dispatch for exactly the cooldown it advertised
+    t[0] = 0.0
+    g = gate(lambda: (False, 1800.0, "usage limit"))
+    held_now = not g.ready()
+    t[0] = 1799
+    still_held = not g.ready()
+    check(held_now and still_held, "dispatch holds for the provider's advertised cooldown")
+
+    # no advertised cooldown still gets a floor, not an instant retry storm
+    t[0] = 0.0
+    g = gate(lambda: (False, 0.0, "overloaded"))
+    g.ready(); t[0] = 299
+    check(not g.ready(), "a cooldown-less failure still backs off (5-minute floor)")
+
+    # an absurd cooldown is capped, so a bad number cannot park the queue for days
+    t[0] = 0.0
+    g = gate(lambda: (False, 999999.0, "nonsense"))
+    g.ready(); t[0] = 3601
+    recovered = []
+    g._probe = lambda: (recovered.append(1), (True, 0.0, ""))[1]
+    check(g.ready() and recovered, "an absurd cooldown is capped at an hour and re-probed")
+
+    # a probe that raises must not stop the factory
+    def boom():
+        raise RuntimeError("probe exploded")
+    t[0] = 0.0
+    check(gate(boom).ready() is True, "a broken probe fails open, never parking the queue")
+
+    # transient infra failures re-queue; they are not decisions for a human
+    src = (ROOT / "orchestrator.py").read_text()
+    check("infra_retries" in src and 'item["status"] = "ready"' in src,
+          "a transient infra failure re-queues instead of escalating")
+
+
 def verify_selftest() -> None:
     rc, out = run(["uv", "run", str(ROOT / "control-plane" / "selftest_k1.py")])
     check(rc == 0 and "ALL PASS" in out, "K1 adapter-spine self-test",
@@ -264,6 +319,7 @@ def main(argv: list[str]) -> int:
     verify_selftest()
     verify_governance()
     verify_ladder_coverage()
+    verify_daemon()
     verify_replay(repo)
     if a.with_docker:
         verify_docker(repo)
