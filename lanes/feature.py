@@ -25,7 +25,7 @@ sys.path.insert(0, str(CP))
 MAX_FIX_ITERS = 3          # bounded builder fix loop (I9): converge or escalate
 MAX_ARCH_ROUNDS = 4        # bounded architect authority loop: enough rounds to close a lockdown cascade
 
-import config, omp, gates, permissions as perm
+import config, omp, gates, meter, permissions as perm
 import envelopes as E
 from canon import CanonResolver
 from session import Run
@@ -68,6 +68,14 @@ class LiveRunner:
         for fallback in chain[1:]:
             if not res.infra_failed:
                 break
+            if fallback.startswith("openrouter/"):
+                allowed, why = meter.allow_paid()
+                if not allowed:
+                    # Below the floor. Stopping here is the point: the run aborts and re-queues,
+                    # which costs time, where continuing would drain the account and still not land.
+                    run.tracer.log(event_detail="paid_route_refused", role=call.role,
+                                   model=fallback, reason=why)
+                    break
             run.tracer.log(event_detail="provider_fallback", role=call.role,
                            from_model=chain[0], to_model=fallback, error=res.error)
             res = self._attempt(replace_call(call, resume_session=None), run, workspace, model=fallback)
@@ -156,6 +164,7 @@ class Lane:
             return self._abort(run, e)
 
     def _feature_phases(self, run) -> bool:
+        run.meter = meter.RunMeter().open()
         # -- resolve (I7: canon gap halts) ------------------------------------
         with run.phase(E.PhaseParams(name="resolve", kind="code", owner="canon",
                        description="Resolve governing canon for the journey by binding")) as ph:
@@ -195,7 +204,18 @@ class Lane:
         # only zero-cost end-to-end check un-runnable from the day the architect was added.
         if not accepted and self.live:
             accepted = self._architect_resolve(run)
+        self._record_cost(run, accepted)
         return run.finish(accepted, reason="" if accepted else self._escalation_reason())
+
+    def _record_cost(self, run, accepted: bool) -> None:
+        """What this run cost in real money, against what it produced. Cost alone is not a metric —
+        cost per LANDED journey is."""
+        m = getattr(run, "meter", None)
+        if m is None:
+            return
+        spend = m.close()
+        run.tracer.log(event_detail="run_cost", paid_usd=spend, accepted=bool(accepted),
+                       journey=self.journey)
 
     def remediate(self, findings: str) -> bool:
         """Close open review findings on an already-built journey, via the bounded fix loop."""

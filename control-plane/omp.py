@@ -227,7 +227,10 @@ def probe(role_name: str, timeout_s: int = 90) -> tuple[bool, float, str]:
     # The role is available if ANY model in its chain answers: the subscription first (free at the
     # margin), then the paid fallback. Reporting the role down while a fallback is live would idle
     # the factory for no reason.
+    import meter
     for model in config.model_chain(role_name):
+        if model.startswith("openrouter/") and not meter.allow_paid()[0]:
+            continue                           # below the balance floor: not a route we may take
         argv = [config.OMP_BIN, "-p", "--mode", "json", "--no-title", "--model", model]
         try:
             proc = subprocess.run(argv, input="Reply with the single word OK.", capture_output=True,

@@ -290,6 +290,68 @@ def verify_daemon() -> None:
           "a transient infra failure re-queues instead of escalating")
 
 
+def verify_portfolio() -> None:
+    """The scheduler must let PROJECTS run in parallel. Bindings were bare entity names, so two
+    products sharing a `User` serialized for no reason, and any foundation's `*` conflicted with
+    every item in the portfolio — one project's foundation would have blocked all the others."""
+    import importlib.util as _il
+    spec = _il.spec_from_file_location("orch_p", ROOT / "orchestrator.py")
+    orch = _il.module_from_spec(spec)
+    spec.loader.exec_module(orch)
+
+    fs = frozenset
+    a_user = fs({"arxus:User", "arxus:Listing"})
+    b_user = fs({"beta:User", "beta:Offer"})
+    a_other = fs({"arxus:BQSScore"})
+    a_found = fs({"arxus:*"})
+    b_found = fs({"beta:*"})
+
+    check(not orch._overlaps(a_user, b_user),
+          "two projects sharing an entity name run in parallel")
+    check(not orch._overlaps(a_found, b_user),
+          "a foundation in one project does not block another project")
+    check(not orch._overlaps(a_found, b_found),
+          "two projects' foundations run in parallel")
+    check(orch._overlaps(a_found, a_other),
+          "a foundation still serializes its OWN project")
+    check(orch._overlaps(a_user, fs({"arxus:Listing"})),
+          "a shared entity within one project still serializes")
+    check(not orch._overlaps(a_user, a_other),
+          "disjoint entities within one project still run in parallel")
+
+    # bindings are namespaced at the source, not just compared that way
+    b = orch._bindings({"id": "x", "kind": "foundation", "repo": "beta"})
+    check(b == fs({"beta:*"}), "a foundation's wildcard is scoped to its repo", str(sorted(b)))
+
+
+def verify_meter() -> None:
+    """The money rail and the value meter. omp's own cost numbers under-reported OpenRouter by
+    20-70x on 2026-08-19, so both are computed from the provider's counter, never from run logs."""
+    sys.path.insert(0, str(ROOT / "control-plane"))
+    import meter  # noqa: E402
+
+    ok, why = meter.allow_paid(lambda: 5.00)
+    check(ok, "a funded balance permits paid routes", why)
+    ok, why = meter.allow_paid(lambda: 0.32)
+    check(not ok, "a balance under the floor refuses paid routes", why)
+    ok, why = meter.allow_paid(lambda: None)
+    check(ok, "unreadable metering fails OPEN — it is a rail, not a gate", why)
+
+    seq = iter([10.0, 12.5])
+    m = meter.RunMeter(reader=lambda: next(seq)); m.open()
+    check(m.close() == 2.5, "a run reports what it actually cost")
+    m = meter.RunMeter(reader=lambda: None); m.open()
+    check(m.close() is None, "an unknown cost reports unknown, never zero")
+
+    lane_src = (ROOT / "lanes" / "feature.py").read_text()
+    check("paid_route_refused" in lane_src, "the lane refuses a paid route below the floor")
+    check("run_cost" in lane_src, "every run records its cost against its outcome")
+    orch_src = (ROOT / "orchestrator.py").read_text()
+    check("paid_usd" in orch_src, "the daemon reports the price with the outcome")
+    omp_src = (ROOT / "control-plane" / "omp.py").read_text()
+    check("meter.allow_paid" in omp_src, "the preflight will not advertise a route it may not take")
+
+
 def verify_selftest() -> None:
     rc, out = run(["uv", "run", str(ROOT / "control-plane" / "selftest_k1.py")])
     check(rc == 0 and "ALL PASS" in out, "K1 adapter-spine self-test",
@@ -320,6 +382,8 @@ def main(argv: list[str]) -> int:
     verify_governance()
     verify_ladder_coverage()
     verify_daemon()
+    verify_portfolio()
+    verify_meter()
     verify_replay(repo)
     if a.with_docker:
         verify_docker(repo)

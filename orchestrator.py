@@ -187,7 +187,7 @@ def _verdict(target):
     import json
     run = _latest_run(target)
     if not run:
-        return False, False, None, ["run produced no verdict"], False, 0.0
+        return False, False, None, ["run produced no verdict"], False, 0.0, None
     run_id = run["run_id"]
     conn = obsdb.connect()
     try:
@@ -196,11 +196,14 @@ def _verdict(target):
         conn.close()
     accepted = merged = transient = False
     cooldown = 0.0
+    cost = None
     for e in (r["events"] if r else []):
         d = json.loads(e["detail"]) if e.get("detail") else {}
         ed = d.get("event_detail")
         if ed == "finish":
             accepted = bool(d.get("accepted")); merged = bool(d.get("merged"))
+        elif ed == "run_cost":
+            cost = d.get("paid_usd")
         elif ed == "agent_no_envelope":
             transient = True                       # an agent produced no output — infra/model failure
             cooldown = max(cooldown, float(d.get("retry_after_s") or 0.0))
@@ -208,7 +211,7 @@ def _verdict(target):
             transient = True                       # the lane stopped itself: undecidable, not a ruling
             cooldown = max(cooldown, float(d.get("retry_after_s") or 0.0))
     blocking = [] if accepted else _blocking(run_id)
-    return accepted, merged, run_id, blocking, transient, cooldown
+    return accepted, merged, run_id, blocking, transient, cooldown, cost
 
 
 def _target_of(item):
@@ -254,26 +257,46 @@ class JudgeGate:
 
 
 # --- decomposition gate (Rev4 §9): only parallelize streams with disjoint artifact bindings -------
-_WILDCARD = frozenset({"*"})                       # unknown scope → conflicts with everything → serial
 
 
 def _bindings(item) -> frozenset:
-    """The artifact bindings the control plane schedules on. A journey's are its canon `Touches`
-    entities; a foundation (or an unresolvable journey) is treated as touching everything, so it
-    runs alone. This is what lets the daemon run non-overlapping journeys in parallel and SERIALIZE
-    overlapping ones, instead of firing blindly and thrashing on merges."""
+    """The artifact bindings the control plane schedules on, NAMESPACED BY PROJECT.
+
+    A journey's bindings are its canon `Touches` entities; a foundation (or an unresolvable journey)
+    is treated as touching everything IN ITS OWN REPO, so it runs alone there. This is what lets the
+    daemon run non-overlapping streams in parallel and serialize overlapping ones.
+
+    The namespace is what makes the portfolio work. Bare entity names collide across repos — two
+    products both having a `User` would have been serialized for no reason — and a bare `*` from any
+    foundation conflicted with EVERY other item, so one project's foundation build would have
+    blocked every other project in the portfolio. Different repos share nothing by construction:
+    separate worktrees, separate git, separate canon."""
+    repo = item.get("repo") or "?"
+    everything = frozenset({f"{repo}:*"})
     if item.get("kind") == "foundation":
-        return _WILDCARD
+        return everything
     jid = item.get("journey") or item["id"]
     try:
         b = canon.CanonResolver(Path(repo_path(item["repo"]))).bindings(jid)
     except Exception:
         b = set()
-    return frozenset(b) if b else _WILDCARD
+    return frozenset(f"{repo}:{e}" for e in b) if b else everything
+
+
+def _repos_of(binding: frozenset) -> set:
+    return {x.split(":", 1)[0] for x in binding}
 
 
 def _overlaps(a: frozenset, b: frozenset) -> bool:
-    return ("*" in a) or ("*" in b) or bool(a & b)
+    """Two streams conflict only within one repo: a per-repo wildcard, or a shared entity."""
+    ra, rb = _repos_of(a), _repos_of(b)
+    if not (ra & rb):
+        return False                                   # different projects never contend
+    if any(x.endswith(":*") and x.split(":", 1)[0] in rb for x in a):
+        return True
+    if any(x.endswith(":*") and x.split(":", 1)[0] in ra for x in b):
+        return True
+    return bool(a & b)
 
 
 def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
@@ -306,11 +329,13 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
             item = by_id.get(iid)
             if not item:
                 continue
-            accepted, merged, run_id, blocking, transient, cooldown = _verdict(_target_of(item))
+            accepted, merged, run_id, blocking, transient, cooldown, cost = _verdict(_target_of(item))
+            item["paid_usd"] = cost
+            price = "" if cost is None else f"  (${cost:.2f} paid)"
             item["run_id"] = run_id
             if accepted and merged:
                 item["status"] = "accepted"
-                print(f"  ✓ accepted  {iid}", flush=True)
+                print(f"  ✓ accepted  {iid}{price}", flush=True)
                 nt.accepted(project=item.get("repo", "—"), item_id=iid, kind=item["kind"],
                             note=item.get("note", ""), run_id=run_id)
             elif (not accepted) and transient:           # infra failure (model overloaded / no envelope)
@@ -349,7 +374,7 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
                 escalate(item, run_id, blocking)
                 nt.escalation(project=item.get("repo", "—"), item_id=iid, kind=item["kind"],
                               note=item.get("note", ""), run_id=run_id, blocking=blocking)
-                print(f"  ⚑ escalated {iid}  → awaiting your ruling (factory keeps running)", flush=True)
+                print(f"  ⚑ escalated {iid}{price}  → awaiting your ruling (factory keeps running)", flush=True)
         # --- allocate + dispatch (Rev4 §9): WIP limit + decomposition gate ----
         # Only co-schedule streams whose artifact bindings are DISJOINT from everything already in
         # flight (and from each other this cycle). Overlapping work is serialized — it waits for the
