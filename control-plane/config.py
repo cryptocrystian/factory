@@ -95,13 +95,28 @@ _FALLBACK_DEFAULTS: dict[str, tuple[str, ...]] = {
 }
 
 
+def paid_fallback_enabled() -> bool:
+    """Paid routes are OFF unless the owner switches them on (OMP_ALLOW_PAID_FALLBACK=1).
+
+    The factory runs on subscriptions, where a run costs nothing at the margin. A fallback bills
+    real money per token, and on 2026-08-19 it did so unattended and unbudgeted while the owner
+    was asleep — which is not a decision software should make for someone. Off by default means an
+    exhausted subscription PAUSES the factory (the preflight already holds dispatch and re-probes
+    every 30 minutes, so it resumes by itself when quota returns) instead of quietly spending."""
+    return os.environ.get("OMP_ALLOW_PAID_FALLBACK", "").strip() in ("1", "true", "yes", "on")
+
+
 def _fallbacks_for(role_name: str) -> tuple[str, ...]:
-    """Env override wins: OMP_FALLBACK_<ROLE> ("" disables the fallback, a comma-list replaces it)."""
+    """Env override wins: OMP_FALLBACK_<ROLE> ("" disables the fallback, a comma-list replaces it).
+    An explicit per-role override is honored even with paid fallbacks off, so a deliberate
+    "use this route right now" still works without flipping the global switch."""
     key = "OMP_FALLBACK_" + role_name.upper().replace("-", "_")
     raw = os.environ.get(key)
-    if raw is None:
-        return _FALLBACK_DEFAULTS.get(role_name, ())
-    return tuple(m.strip() for m in raw.split(",") if m.strip())
+    if raw is not None:
+        return tuple(m.strip() for m in raw.split(",") if m.strip())
+    if not paid_fallback_enabled():
+        return ()
+    return _FALLBACK_DEFAULTS.get(role_name, ())
 
 
 def model_chain(role_name: str) -> tuple[str, ...]:
