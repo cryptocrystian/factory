@@ -88,6 +88,15 @@ for fname, needle, want_wait in cases:
 behaved = omp.AgentResult(ok=False, envelope=None, session_id="s", cost_usd=0.0, timed_out=False,
                           events=9, raw_final="not json", error="envelope parse failed")
 check("parse failure is not infra", not behaved.infra_failed)
+# ...even when the stream ALSO carried a provider error that auto-retry absorbed (2026-08-19: a
+# grok-4.6 stream did exactly this, and the run aborted instead of re-prompting).
+recovered = omp.AgentResult(ok=False, envelope=None, session_id="s", cost_usd=0.1, timed_out=False,
+                            events=900, raw_final="{not json", error="envelope parse failed",
+                            provider_error="transient 500, retried")
+check("answered-then-garbled is not infra", not recovered.infra_failed)
+check("never-answered with a provider error IS infra",
+      omp.AgentResult(ok=False, envelope=None, session_id=None, cost_usd=0.0, timed_out=False,
+                      events=3, raw_final="", error="", provider_error="rate limited").infra_failed)
 
 # 5. the provider fallback chain: a paid second route to the same judgment (2026-08-18).
 print("provider fallback chain:")

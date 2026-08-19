@@ -49,10 +49,14 @@ class AgentResult:
 
     @property
     def infra_failed(self) -> bool:
-        """No envelope AND the provider itself errored — the model side was down, not misbehaving.
-        Distinct from a model that answered but produced an unparseable envelope: that's a behavior
-        problem the caller can re-prompt, this one only clears with time."""
-        return (not self.ok) and bool(self.provider_error)
+        """No envelope AND the provider itself errored AND the model never answered at all.
+
+        The last clause is load-bearing. A long agentic stream can carry a transient provider error
+        that auto-retry absorbed, and still end with a final message; if that message's envelope
+        merely fails to parse, the failure is BEHAVIOUR, not infrastructure, and re-prompting the
+        same session is the right response. Without this, grok-4.6 emitting unparseable JSON on
+        2026-08-19 was misread as a downed provider and aborted a run that should have re-prompted."""
+        return (not self.ok) and bool(self.provider_error) and not self.raw_final
 
 
 def _argv(call: E.AgentCall, r: config.Role, session_dir: Path, model: str | None = None) -> list[str]:
