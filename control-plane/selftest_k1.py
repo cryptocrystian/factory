@@ -95,6 +95,13 @@ import config
 chain = config.model_chain('reviewer')
 check("reviewer keeps its subscription model first", chain[0] == config.role('reviewer').model, chain[0])
 check("reviewer has a fallback route", len(chain) > 1, " -> ".join(chain[1:]) or "none")
+# A bare model name is fuzzy-matched across every authenticated provider, so any role with a PAID
+# fallback must name its provider explicitly or the "free first" ordering is a fiction.
+for _role in ('reviewer', 'test-author', 'product-manager'):
+    _chain = config.model_chain(_role)
+    check(f"{_role} primary names its provider", '/' in _chain[0], _chain[0])
+    check(f"{_role} primary is the subscription", _chain[0].startswith('openai-codex/'), _chain[0])
+    check(f"{_role} routes are distinct", len(set(_chain)) == len(_chain))
 check("the direct vendor route precedes any aggregator",
       all(not m.startswith('openrouter/') for m in chain[:-1]) and 'openrouter/' in chain[-1],
       "fewer parties see the diff on the route we actually use")

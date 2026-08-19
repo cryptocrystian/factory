@@ -38,9 +38,14 @@ ROLES: dict[str, Role] = {
     "builder": Role("builder", "claude-opus-5", "anthropic", "medium",
                     _SRC, "builder/system.md", "build", timeout_s=1500),
     # test-author + reviewer: DIFFERENT family from the builder (I3, mandatory).
-    "test-author": Role("test-author", "gpt-5.6-sol", "openai", "high",
+    # PROVIDER-QUALIFIED ON PURPOSE. A bare "gpt-5.6-terra" is fuzzy-matched, and once an
+    # OPENAI_API_KEY exists on the host it resolves to the paid `openai` provider instead of the
+    # `openai-codex` subscription — silently, with no error and no log line, so the factory would
+    # bill per token while free quota sat unused. Naming the provider is what makes "subscription
+    # first, paid only on failure" actually true.
+    "test-author": Role("test-author", "openai-codex/gpt-5.6-sol", "openai", "high",
                         _SRC, "test-author/system.md", "test", timeout_s=900),
-    "reviewer": Role("reviewer", "gpt-5.6-terra", "openai", "high",
+    "reviewer": Role("reviewer", "openai-codex/gpt-5.6-terra", "openai", "high",
                      _RO + ("bash",), "reviewer/system.md", "review", timeout_s=600),
     # architect: the technical authority. Resolves reviewer findings the builder can't (protected
     # paths — migrations, canon) so the factory self-governs; surfaces only genuine business/product
@@ -51,7 +56,7 @@ ROLES: dict[str, Role] = {
                       _SRC, "architect/system.md", "architect", timeout_s=1800),
     # product manager: rules routine product decisions the architect routes to it, surfacing only
     # owner-level business forks. DIFFERENT family from the architect (cross-check).
-    "product-manager": Role("product-manager", "gpt-5.6-sol", "openai", "high",
+    "product-manager": Role("product-manager", "openai-codex/gpt-5.6-sol", "openai", "high",
                             _RO + ("write",), "product-manager/system.md", "architect", timeout_s=1200),
 }
 
