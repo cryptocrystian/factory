@@ -73,17 +73,25 @@ ROLES: dict[str, Role] = {
 #
 # Cross-family independence (I3) is preserved BY MODEL, not by billing route: the reviewer's
 # fallback is still an OpenAI-family model, just reached through OpenRouter rather than Codex.
-# ORDER IS A PRIVACY DECISION, not just a price one. The judge reads repo diffs, so the fewer
-# parties in that path the better: the direct OpenAI API is the same vendor we already trust with
-# this traffic via Codex, while an aggregator is an additional hop that may log. OpenRouter's
-# per-request privacy controls (`provider.zdr`, `provider.data_collection`) cannot help here —
-# they live in the request body, which omp builds and exposes no way to set — and its account-level
-# data policy is dashboard-only, with no API. So OpenRouter sits LAST: a real route, reached only
-# when both OpenAI paths are down, and removable entirely with OMP_FALLBACK_<ROLE>.
+# EVERY fallback goes through OpenRouter — the owner bought it precisely so the factory would not
+# need a direct vendor API key, and no direct key is configured on the box. Order:
+#
+#   1. the Codex SUBSCRIPTION (openai-codex/…), always first and free at the margin. Provider-
+#      qualified deliberately: a bare "gpt-5.6-terra" is fuzzy-matched across authenticated
+#      providers, so a stray vendor key on the host would silently outrank the subscription.
+#   2. the SAME MODEL through OpenRouter — identical judgment, paid per token, reached only when
+#      the subscription's quota is genuinely spent.
+#   3. a DIFFERENT FAMILY through OpenRouter (xAI Grok) — for when OpenAI is broadly unavailable
+#      rather than just out of quota. Cheaper on output than the primary, and its independence from
+#      BOTH the Anthropic builder and the OpenAI judge is a feature, not a compromise: I3 asks the
+#      reviewer not to share the builder's family, and Grok shares neither.
+#
+# Ids are overridable per role by env var, because an aggregator's catalog moves faster than this
+# file does.
 _FALLBACK_DEFAULTS: dict[str, tuple[str, ...]] = {
-    "test-author":     ("openai/gpt-5.6-sol",   "openrouter/openai/gpt-5.6-sol"),
-    "reviewer":        ("openai/gpt-5.6-terra", "openrouter/openai/gpt-5.6-terra"),
-    "product-manager": ("openai/gpt-5.6-sol",   "openrouter/openai/gpt-5.6-sol"),
+    "test-author":     ("openrouter/openai/gpt-5.6-sol",   "openrouter/x-ai/grok-4.6"),
+    "reviewer":        ("openrouter/openai/gpt-5.6-terra", "openrouter/x-ai/grok-4.6"),
+    "product-manager": ("openrouter/openai/gpt-5.6-sol",   "openrouter/x-ai/grok-4.6"),
 }
 
 

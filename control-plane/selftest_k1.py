@@ -102,12 +102,15 @@ for _role in ('reviewer', 'test-author', 'product-manager'):
     check(f"{_role} primary names its provider", '/' in _chain[0], _chain[0])
     check(f"{_role} primary is the subscription", _chain[0].startswith('openai-codex/'), _chain[0])
     check(f"{_role} routes are distinct", len(set(_chain)) == len(_chain))
-check("the direct vendor route precedes any aggregator",
-      all(not m.startswith('openrouter/') for m in chain[:-1]) and 'openrouter/' in chain[-1],
-      "fewer parties see the diff on the route we actually use")
-check("cross-family independence survives the reroute",
-      all('openai' in m or 'gpt' in m for m in chain),
-      "reviewer stays OpenAI-family, billed differently")
+check("no fallback uses a direct vendor API",
+      all(m.startswith('openrouter/') for m in chain[1:]),
+      "every paid route goes through OpenRouter")
+check("a second family backs up the judge",
+      any('openai' not in m and 'gpt' not in m for m in chain[1:]),
+      chain[-1])
+check("no reroute lands on the builder's family",
+      not any('claude' in m or 'anthropic' in m for m in chain),
+      "reviewer never shares the builder's family (I3)")
 check("builder is not rerouted", config.model_chain('builder') == (config.role('builder').model,))
 import os
 os.environ['OMP_FALLBACK_REVIEWER'] = ''
