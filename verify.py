@@ -28,7 +28,11 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-REC = ROOT / "runs" / "2026-08-07-p0-jrn-s1"
+# The golden recording is versioned (gzipped) so this runs anywhere, notably the VPS. The
+# uncompressed original under runs/ is preferred when present but is not required.
+REC_VERSIONED = ROOT / "control-plane" / "goldens" / "p0-jrn-s1"
+REC_LOCAL = ROOT / "runs" / "2026-08-07-p0-jrn-s1"
+REC = REC_LOCAL if REC_LOCAL.is_dir() else REC_VERSIONED
 
 results: list[tuple[bool, str, str]] = []
 

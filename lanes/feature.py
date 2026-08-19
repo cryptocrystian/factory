@@ -102,11 +102,24 @@ class ReplayRunner:
     def __init__(self, rec_dir: Path):
         self.rec = Path(rec_dir)
 
+    def _recorded(self, name: str) -> list[str]:
+        """A recorded stream, plain or gzipped. The golden set ships compressed (10.5MB -> 1.5MB)
+        so it can live in version control and the regression runs on every machine, including the
+        VPS where the factory actually runs and where runs/ is gitignored."""
+        plain = self.rec / name
+        if plain.is_file():
+            return plain.read_text().splitlines()
+        gz = self.rec / f"{name}.gz"
+        if gz.is_file():
+            import gzip
+            return gzip.decompress(gz.read_bytes()).decode().splitlines()
+        raise ReplayGap(f"no recorded stream {name!r} in {self.rec}")
+
     def run(self, call: E.AgentCall, run: Run, workspace: Path):
         if call.role not in self.MAP:
             raise ReplayGap(f"no recorded stream for role {call.role!r} in {self.rec.name} — "
                             f"replay covers {sorted(self.MAP)}")
-        lines = (self.rec / self.MAP[call.role]).read_text().splitlines()
+        lines = self._recorded(self.MAP[call.role])
         sid, final, cost, n, _perr, _wait = omp._parse_stream(lines)
         env = E.ENVELOPE_TYPES[call.output_type].model_validate_json(omp._json_slice(final))
         if call.role == "planner" and (self.rec / "plan.md").exists():

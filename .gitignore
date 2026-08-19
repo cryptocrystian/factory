@@ -28,3 +28,7 @@ ops/*.key
 .env
 owner-import.txt
 .env*
+
+# The golden replay recording is versioned deliberately (gzipped, ~1.5MB): it is the input to
+# verify.py's regression and is NOT regenerable, unlike everything else under runs/.
+!control-plane/goldens/
