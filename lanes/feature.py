@@ -129,6 +129,8 @@ class Lane:
         self.live = live
         self.design = config.design_policy(self.repo)   # None unless the repo opts into the anti-slop gate
         self._agent_gates_ok = True   # agent-phase gates enforce on live runs (reset per pass/fix-iter)
+        self._last_breach: list[str] = []   # paths a role tried to write outside its grant (rolled back)
+        self._human_brief = None
 
     def run(self) -> bool:
         run = Run(self.repo, lane="feature", target=self.journey)
@@ -256,6 +258,10 @@ class Lane:
                 pr = perm.enforce(run, role)
                 if not pr.ok:
                     run.tracer.log(event_detail="phase_aborted_breach", role=role)
+                    # The write is already rolled back. Remember WHAT was attempted so the caller can
+                    # hand the agent a corrective brief: a role reaching outside its grant is a
+                    # recoverable mistake, and ending the run over it wastes every round it had left.
+                    self._last_breach = list(pr.breaches)
                     return None
             for g in gate_fns:
                 rep = g(res.envelope, run)
@@ -384,7 +390,23 @@ class Lane:
                         "leave the build blocked on it. Return your envelope."),
                 cwd=run.workspace, add_dirs=[run.dir], gate_fns=[])
             if arch is None:
-                return False
+                breach, self._last_breach = self._last_breach, []
+                if breach:
+                    # It wrote somewhere it may not. That is a misunderstanding of its authority, not
+                    # an unresolvable finding — name the grant and let it spend another round. On
+                    # 2026-08-19 this ended JRN-S4 after ONE of four rounds, and escalated to the
+                    # owner three findings that were the architect's own job to close.
+                    grants = ", ".join(config.WRITE_GRANTS.get("architect") or [])
+                    run.tracer.log(event_detail="architect_breach_corrected", round=i, breach=breach)
+                    findings = [
+                        f"Your write to {', '.join(breach)} was ROLLED BACK: it is outside your grant. "
+                        f"You may write ONLY {grants}. Verification scripts, tests and app source belong "
+                        "to other roles — you cannot edit what judges your work. Resolve the findings "
+                        "below by authoring a migration or a canonical decision instead.",
+                        *findings,
+                    ]
+                    continue
+                return self._unresolved(run)
             # Record any surfaced decision as a PENDING SIGN-OFF — do not treat it as a blocker here.
             # Whether it truly blocks is decided by the reviewer below: if the build (with the seam +
             # build seed the architect installed) passes review, the decision is a non-blocking
@@ -420,11 +442,73 @@ class Lane:
                 run.tracer.log(event_detail="architect_resolved", round=i,
                                pending_signoff=bool(self._human_brief))
                 return True
-        # Rounds exhausted without acceptance: the residue genuinely blocks — escalate (with the
-        # architect's packaged decision if it surfaced one, else the technical residue).
+        # Rounds exhausted. If the architect surfaced a DECISION, the owner is not the next stop —
+        # the product manager is. It is a different family from the architect and it owns product
+        # calls, so a question that is merely "canon doesn't say yet" gets ruled here and the build
+        # continues. Only what the PM itself judges owner-level (pricing, legal, business model,
+        # risk posture) reaches a human. Without this the PM was configured, prompted, granted
+        # canon/** — and never once invoked, so every decision went straight to the owner.
+        return self._unresolved(run)
+
+    def _unresolved(self, run) -> bool:
+        """The single exit for "the architect could not close it". EVERY such exit comes through
+        here, so a decision cannot reach the owner without the PM having seen it first — the early
+        return on a failed architect round used to skip the triage entirely."""
+        if self._human_brief and self._pm_triage(run):
+            ruling = run.dir / "pm-ruling.md"
+            if self._converge(run, [ruling.read_text() if ruling.is_file() else "apply the PM ruling"], ""):
+                run.tracer.log(event_detail="pm_resolved")
+                return True
         run.tracer.log(event_detail="architect_not_resolved", rounds=MAX_ARCH_ROUNDS,
                        human_brief=self._human_brief or {})
         return False
+
+    def _pm_triage(self, run) -> bool:
+        """Route the architect's surfaced decision to the product manager. True iff the PM RULED it
+        (and wrote the ruling to canon); False if the PM judged it the owner's call, in which case
+        the escalation continues carrying the PM's sharpened brief."""
+        hb = self._human_brief or {}
+        (run.dir / "pm-question.md").write_text(
+            f"# Decision routed from the architect\n\n**Q:** {hb.get('question','')}\n\n"
+            f"**Why it surfaced:** {hb.get('why','')}\n\n**Options considered:** {hb.get('options',[])}\n\n"
+            f"**Architect's recommendation:** {hb.get('recommendation','')}\n")
+        pm = self._agent(run, "product-manager", "architect",
+            prompt=("The architect could not resolve a finding without a PRODUCT judgment and routed it "
+                    "to you — read pm-question.md (added run dir) and context.md for governing canon. "
+                    "Decide whether this is YOURS (a routine product call that follows from existing "
+                    "canon and strategy) or the OWNER'S (pricing, legal/compliance, business model, "
+                    "risk posture, a net-new bet). If it is yours, RULE it by authoring the smallest "
+                    "canon clarification that removes the ambiguity — never by weakening an invariant, "
+                    "AC or test — and set disposition 'resolved'. If it is the owner's, set "
+                    "disposition 'escalate' and sharpen human_brief so they can rule it in one read. "
+                    "When unsure, escalate. Return your envelope."),
+            cwd=run.workspace, add_dirs=[run.dir], gate_fns=[])
+        if pm is None:
+            self._last_breach = []          # a PM breach must not masquerade as a ruling
+            run.tracer.log(event_detail="pm_unavailable")
+            return False
+        findings = [f for f in (getattr(pm, "findings", []) or [])]
+        resolved = bool(findings) and all(
+            getattr(f, "disposition", "") == "resolved" for f in findings)
+        pm_brief = getattr(pm, "human_brief", {}) or {}
+        if pm_brief.get("needed"):
+            # The PM says this is the owner's. Its brief supersedes the architect's — it is the
+            # product voice, and it has already filtered out everything it could rule itself.
+            self._human_brief = pm_brief
+            run.tracer.log(event_detail="pm_escalated", question=pm_brief.get("question", ""))
+            return False
+        if not resolved:
+            run.tracer.log(event_detail="pm_inconclusive")
+            return False
+        run.commit(getattr(pm, "commit_message", None) or f"pm({self.journey}): rule product decision")
+        (run.dir / "pm-ruling.md").write_text(
+            "# The product manager ruled this decision\n\n"
+            + (getattr(pm, "remediation_brief", "") or "")
+            + "\n\n" + "\n".join(f"- {getattr(f,'ref','')}: {getattr(f,'action','')}" for f in findings))
+        run.tracer.log(event_detail="pm_ruled",
+                       refs=[getattr(f, "ref", "") for f in findings])
+        self._human_brief = None            # ruled, so nothing is owed to the owner
+        return True
 
     def _escalation_reason(self) -> str:
         """What the run reports on escalation. A surfaced decision is a packaged business/product

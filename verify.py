@@ -119,6 +119,101 @@ def verify_config() -> None:
     os.environ.pop("OMP_ALLOW_PAID_FALLBACK", None)
 
 
+def verify_governance() -> None:
+    """The escalation ladder, exercised with stub agents: architect -> PM -> owner.
+
+    These are the two failures that put JRN-S4 in front of the owner on 2026-08-19: a breach ended
+    the run after one of four architect rounds, and the PM — configured, prompted and granted
+    canon/** — was never invoked at all, so every decision skipped it."""
+    import contextlib
+    sys.path.insert(0, str(ROOT / "control-plane"))
+    import envelopes as E  # noqa: E402
+    import importlib.util as _il
+    spec = _il.spec_from_file_location("feat_v", ROOT / "lanes" / "feature.py")
+    feat = _il.module_from_spec(spec)
+    spec.loader.exec_module(feat)
+
+    scratch = ROOT / "runs" / "_verify"; scratch.mkdir(parents=True, exist_ok=True)
+
+    class Tracer:
+        def __init__(self): self.events = []
+        def log(self, **kw): self.events.append(kw)
+        def gate(self, r): pass
+        def record_call(self, *a): pass
+
+    class Ph:
+        def ok(self): pass
+
+    class Run:
+        def __init__(self):
+            self.dir = scratch; self.workspace = scratch; self.tracer = Tracer()
+        @contextlib.contextmanager
+        def phase(self, p): yield Ph()
+        def commit(self, m): pass
+        def finish(self, a, reason=""): return a
+
+    def lane(agent_impl, converge=False):
+        ln = feat.Lane.__new__(feat.Lane)
+        ln.repo = scratch; ln.journey = "VERIFY"; ln.runner = None; ln.live = True
+        ln.design = None; ln._agent_gates_ok = True; ln._last_breach = []; ln._human_brief = None
+        ln._agent = agent_impl.__get__(ln)
+        ln._converge = (lambda self, r, f, u: converge).__get__(ln)
+        ln._review = (lambda self, r: (False, ["blocking"], None)).__get__(ln)
+        return ln
+
+    def dets(run): return [e.get("event_detail") for e in run.tracer.events]
+    finding = lambda d: E.ArchitectFinding(ref="AC-V-01", disposition=d, action="x", **{"class": "product"})
+
+    # 1. a breach costs a round, not the run
+    seen = []
+    def breach_once(self, run, role, ot, prompt, cwd, add_dirs, gate_fns, commit_msg=None):
+        seen.append(role)
+        if role == "architect" and seen.count("architect") == 1:
+            self._last_breach = ["M scripts/verify-x.sh"]
+        return None
+    r = Run(); lane(breach_once)._architect_resolve(r)
+    check(seen.count("architect") >= 2, "an architect breach costs a round, not the run",
+          f"{seen.count('architect')} rounds used")
+    check("architect_breach_corrected" in dets(r), "the breach is named back to the architect")
+
+    # 2. the PM rules a routine product call -> the owner never sees it
+    def pm_rules(self, run, role, ot, prompt, cwd, add_dirs, gate_fns, commit_msg=None):
+        if role == "architect":
+            self._human_brief = {"needed": True, "question": "q", "why": "w", "options": [], "recommendation": "r"}
+            return None
+        return E.ArchitectOutput(status="success", summary="ruled", findings=[finding("resolved")],
+                                 remediation_brief="apply")
+    ln = lane(pm_rules, converge=True); r = Run()
+    accepted = ln._architect_resolve(r)
+    check(accepted is True, "a PM-ruled decision resolves the run")
+    check(ln._human_brief is None, "a PM-ruled decision leaves nothing for the owner")
+    check("pm_ruled" in dets(r), "the PM ruling is recorded")
+
+    # 3. the PM judges it the owner's -> escalate, carrying the PM's sharper brief
+    def pm_escalates(self, run, role, ot, prompt, cwd, add_dirs, gate_fns, commit_msg=None):
+        if role == "architect":
+            self._human_brief = {"needed": True, "question": "architect phrasing", "why": "w",
+                                 "options": [], "recommendation": "r"}
+            return None
+        return E.ArchitectOutput(status="success", summary="owner", findings=[finding("escalate")],
+                                 human_brief={"needed": True, "question": "PM phrasing", "why": "business model",
+                                              "options": [], "recommendation": "r"})
+    ln = lane(pm_escalates); r = Run()
+    check(ln._architect_resolve(r) is False, "an owner-level decision still escalates")
+    check((ln._human_brief or {}).get("question") == "PM phrasing",
+          "the owner reads the PM's brief, not the architect's")
+    check("pm_escalated" in dets(r), "the PM escalation is recorded")
+
+    # 4. a PM that could not run must never look like a ruling
+    def pm_dead(self, run, role, ot, prompt, cwd, add_dirs, gate_fns, commit_msg=None):
+        if role == "architect":
+            self._human_brief = {"needed": True, "question": "q", "why": "w", "options": [], "recommendation": "r"}
+        return None
+    ln = lane(pm_dead, converge=True); r = Run()
+    check(ln._architect_resolve(r) is False, "an unavailable PM does not fake a ruling")
+    check("pm_unavailable" in dets(r), "an unavailable PM is recorded as such")
+
+
 def verify_selftest() -> None:
     rc, out = run(["uv", "run", str(ROOT / "control-plane" / "selftest_k1.py")])
     check(rc == 0 and "ALL PASS" in out, "K1 adapter-spine self-test",
@@ -146,6 +241,7 @@ def main(argv: list[str]) -> int:
     print("factory verify — no model calls, no spend\n")
     verify_config()
     verify_selftest()
+    verify_governance()
     verify_replay(repo)
     if a.with_docker:
         verify_docker(repo)
