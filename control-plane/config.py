@@ -151,6 +151,32 @@ class Budget:
     # token ceiling left open until tracer usage semantics are pinned (P0 finding)
 
 
+# SSSF hard rule 7: every phase earns a description — one sentence on what it does and WHY, never
+# a restatement of the name. It is the only intent the trace, console and observatory ever show, and
+# ours said "planner phase" / "builder phase" for every phase until 2026-08-20, which is precisely
+# the anti-pattern the rule rejects.
+PHASE_INTENT: dict[str, str] = {
+    "planner": "Turn the journey's governing canon into a plan the builder can implement without asking questions",
+    "builder": "Implement the plan against canon and report every file it changed",
+    "test-author": "Author the acceptance tests the build must satisfy — a different family from the builder, so the producer never sets its own bar",
+    "reviewer": "Judge independently whether what was built is what canon actually asked for",
+    "architect": "Resolve what the builder cannot: author the migration or canonical decision that makes the build satisfy canon",
+    "product-manager": "Rule the product question the architect surfaced, or confirm it belongs to the owner",
+}
+
+
+def phase_intent(name: str) -> str:
+    return PHASE_INTENT.get(name) or f"Run the {name} phase"
+
+
+def validate_roles(names) -> None:
+    """SSSF hard rule 1: validate before running. A misnamed or missing role must fail BEFORE
+    anything spawns — otherwise the run discovers it three phases and several dollars deep."""
+    missing = [n for n in names if n not in ROLES]
+    if missing:
+        raise KeyError(f"unknown role(s) {missing}; roster has {sorted(ROLES)}")
+
+
 def role(name: str) -> Role:
     if name not in ROLES:
         raise KeyError(f"unknown role {name!r}; known: {list(ROLES)}")

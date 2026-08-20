@@ -22,6 +22,9 @@ from pathlib import Path
 CP = Path(__file__).resolve().parent.parent / "control-plane"
 sys.path.insert(0, str(CP))
 
+# Every role this lane can call. Validated before a run spawns anything (hard rule 1).
+LANE_ROLES = ("planner", "builder", "test-author", "reviewer", "architect", "product-manager")
+
 MAX_FIX_ITERS = 3          # bounded builder fix loop (I9): converge or escalate
 MAX_ARCH_ROUNDS = 4        # bounded architect authority loop: enough rounds to close a lockdown cascade
 
@@ -157,6 +160,7 @@ class Lane:
         run = Run(self.repo, lane="feature", target=self.journey)
         self._agent_gates_ok = True
         self._human_brief = None                 # set by the architect when it surfaces a decision
+        config.validate_roles(LANE_ROLES)                 # hard rule 1: fail before anything spawns
         run.tracer.log(event_detail="lane_start", journey=self.journey, mode="live" if self.live else "replay")
         try:
             return self._feature_phases(run)
@@ -274,10 +278,12 @@ class Lane:
         return run.finish(False, reason=f"{e.role} unavailable ({e.kind}): {e.error}")
 
     # -- phase helpers ---------------------------------------------------------
-    def _agent(self, run, role, output_type, prompt, cwd, add_dirs, gate_fns, commit_msg=None):
+    def _agent(self, run, role, output_type, prompt, cwd, add_dirs, gate_fns, commit_msg=None,
+               intent=None):
         r = config.role(role)
         with run.phase(E.PhaseParams(name=role, kind="agent", owner=role,
-                       description=f"{role} phase", writes=config.WRITE_GRANTS.get(role))) as ph:
+                       description=intent or config.phase_intent(role),
+                       writes=config.WRITE_GRANTS.get(role))) as ph:
             call = E.AgentCall(role=role, output_type=output_type, prompt=prompt,
                                add_dirs=[str(d) for d in add_dirs])
             res = self.runner.run(call, run, cwd)
@@ -381,6 +387,7 @@ class Lane:
                 fixmd += f"\n\n## Failing unit output\n```\n{unit_evidence[-1500:]}\n```"
             (run.dir / f"findings-{i}.md").write_text(fixmd)
             fix = self._agent(run, "builder", "build",
+                             intent=f"Close review round {i}'s findings in source, without weakening canon",
                              prompt=(f"Close the findings in findings-{i}.md (added run dir), SOURCE only. "
                                      "Read context.md for governing canon. Self-verify "
                                      "gen:tokens/check:tokens/typecheck." + self._design_selfcheck()
@@ -414,12 +421,13 @@ class Lane:
         it can write — the never-weaken-canon rule is held by its charter, the different-family tests
         it cannot edit, and the audit trail here."""
         approved, findings, _ = self._review(run)          # current blocking findings post-builder-loop
-        if approved:
+        if approved and self._retest(run):                 # never accept on a stale green (§6.5)
             return True
         for i in range(1, MAX_ARCH_ROUNDS + 1):
             (run.dir / f"arch-findings-{i}.md").write_text(
                 "# Blocking findings the builder could not close\n\n" + "\n".join(f"- {f}" for f in findings))
             arch = self._agent(run, "architect", "architect",
+                intent=f"Round {i}: author the migration or canon decision the builder may not write",
                 prompt=(f"The builder's fix loop could not close the findings in arch-findings-{i}.md "
                         "(added run dir) — they require a protected path only you may write (a database "
                         "migration or a canonical decision). Read context.md for governing canon. Triage "
@@ -480,7 +488,7 @@ class Lane:
                                pending_signoff=bool(self._human_brief))
                 return True
             approved, findings, _ = self._review(run)       # fresh findings for the next architect round
-            if approved:
+            if approved and self._retest(run):              # never accept on a stale green (§6.5)
                 run.tracer.log(event_detail="architect_resolved", round=i,
                                pending_signoff=bool(self._human_brief))
                 return True
@@ -515,6 +523,7 @@ class Lane:
             f"**Why it surfaced:** {hb.get('why','')}\n\n**Options considered:** {hb.get('options',[])}\n\n"
             f"**Architect's recommendation:** {hb.get('recommendation','')}\n")
         pm = self._agent(run, "product-manager", "architect",
+            intent="Rule the architect's product question, or confirm it is the owner's call",
             prompt=("The architect could not resolve a finding without a PRODUCT judgment and routed it "
                     "to you — read pm-question.md (added run dir) and context.md for governing canon. "
                     "Decide whether this is YOURS (a routine product call that follows from existing "
@@ -551,6 +560,19 @@ class Lane:
                        refs=[getattr(f, "ref", "") for f in findings])
         self._human_brief = None            # ruled, so nothing is owed to the owner
         return True
+
+    def _retest(self, run) -> bool:
+        """The stale-green-light guard (SSSF §6.5, ported 2026-08-20).
+
+        A review may only accept a tree whose suite is green RIGHT NOW. Both accept-on-review paths
+        in the architect loop could return True on a tree whose last recorded unit result was RED:
+        `_converge` exits when its final iteration fails, and a fresh review of that same tree was
+        enough to accept it. Tests and approval must describe the same tree, so the suite is re-run
+        as a code phase before any review-only acceptance."""
+        rep = gates.cmd_gate("test:unit", "npm run test:unit")(None, run)
+        run.tracer.gate(rep)
+        run.tracer.log(event_detail="retest_before_accept", passed=bool(rep.passed))
+        return rep.passed
 
     def _escalation_reason(self) -> str:
         """What the run reports on escalation. A surfaced decision is a packaged business/product

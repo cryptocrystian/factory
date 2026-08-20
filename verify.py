@@ -170,7 +170,7 @@ def verify_governance() -> None:
 
     # 1. a breach costs a round, not the run
     seen = []
-    def breach_once(self, run, role, ot, prompt, cwd, add_dirs, gate_fns, commit_msg=None):
+    def breach_once(self, run, role, ot, prompt, cwd, add_dirs, gate_fns, commit_msg=None, **kw):
         seen.append(role)
         if role == "architect" and seen.count("architect") == 1:
             self._last_breach = ["M scripts/verify-x.sh"]
@@ -181,7 +181,7 @@ def verify_governance() -> None:
     check("architect_breach_corrected" in dets(r), "the breach is named back to the architect")
 
     # 2. the PM rules a routine product call -> the owner never sees it
-    def pm_rules(self, run, role, ot, prompt, cwd, add_dirs, gate_fns, commit_msg=None):
+    def pm_rules(self, run, role, ot, prompt, cwd, add_dirs, gate_fns, commit_msg=None, **kw):
         if role == "architect":
             self._human_brief = {"needed": True, "question": "q", "why": "w", "options": [], "recommendation": "r"}
             return None
@@ -194,7 +194,7 @@ def verify_governance() -> None:
     check("pm_ruled" in dets(r), "the PM ruling is recorded")
 
     # 3. the PM judges it the owner's -> escalate, carrying the PM's sharper brief
-    def pm_escalates(self, run, role, ot, prompt, cwd, add_dirs, gate_fns, commit_msg=None):
+    def pm_escalates(self, run, role, ot, prompt, cwd, add_dirs, gate_fns, commit_msg=None, **kw):
         if role == "architect":
             self._human_brief = {"needed": True, "question": "architect phrasing", "why": "w",
                                  "options": [], "recommendation": "r"}
@@ -209,7 +209,7 @@ def verify_governance() -> None:
     check("pm_escalated" in dets(r), "the PM escalation is recorded")
 
     # 4. a PM that could not run must never look like a ruling
-    def pm_dead(self, run, role, ot, prompt, cwd, add_dirs, gate_fns, commit_msg=None):
+    def pm_dead(self, run, role, ot, prompt, cwd, add_dirs, gate_fns, commit_msg=None, **kw):
         if role == "architect":
             self._human_brief = {"needed": True, "question": "q", "why": "w", "options": [], "recommendation": "r"}
         return None
@@ -352,6 +352,45 @@ def verify_meter() -> None:
     check("meter.allow_paid" in omp_src, "the preflight will not advertise a route it may not take")
 
 
+def verify_stale_green() -> None:
+    """SSSF §6.5: a review may only accept a tree whose suite is green right now. Ported after the
+    install-and-diff on 2026-08-20 found both architect accept-paths returning True on a review
+    alone, over a tree whose last unit result could have been red."""
+    import ast
+    src = (ROOT / "lanes" / "feature.py").read_text()
+    tree = ast.parse(src)
+    lane = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "Lane")
+    fns = {n.name: n for n in lane.body if isinstance(n, ast.FunctionDef)}
+    check("_retest exists", "_retest" in fns)
+    ar = ast.dump(fns["_architect_resolve"])
+    # every `return True` in the architect loop must be guarded by a re-test
+    approvals = ar.count("'_retest'")
+    check(approvals >= 2, "every review-only acceptance re-runs the suite first",
+          f"{approvals} guarded accept paths")
+    check("retest_before_accept" in src, "the re-test is recorded in the trace")
+
+
+def verify_phase_intent() -> None:
+    """SSSF hard rule 7: a phase description is one sentence on what it does and WHY — never a
+    restatement of the name. It is the only intent the trace and the observatory ever show, and
+    ours emitted "planner phase" / "builder phase" for every phase until the 2026-08-20 diff."""
+    sys.path.insert(0, str(ROOT / "control-plane"))
+    import config  # noqa: E402
+    for r in ("planner", "builder", "test-author", "reviewer", "architect", "product-manager"):
+        d = config.phase_intent(r)
+        check(d and r.replace("-", " ") not in d.lower() and len(d.split()) >= 6,
+              f"{r} phase description states intent, not its own name", d[:64] + "…")
+    src = (ROOT / "lanes" / "feature.py").read_text()
+    check('description=f"{role} phase"' not in src, "no phase falls back to a name restatement")
+    # hard rule 1: the roster is validated before anything spawns
+    check("validate_roles" in src, "the lane validates its roster before spending")
+    try:
+        config.validate_roles(["planner", "nope"])
+        check(False, "an unknown role fails fast")
+    except KeyError:
+        check(True, "an unknown role fails fast, before any agent spawns")
+
+
 def verify_selftest() -> None:
     rc, out = run(["uv", "run", str(ROOT / "control-plane" / "selftest_k1.py")])
     check(rc == 0 and "ALL PASS" in out, "K1 adapter-spine self-test",
@@ -384,6 +423,8 @@ def main(argv: list[str]) -> int:
     verify_daemon()
     verify_portfolio()
     verify_meter()
+    verify_stale_green()
+    verify_phase_intent()
     verify_replay(repo)
     if a.with_docker:
         verify_docker(repo)
