@@ -118,7 +118,47 @@ def dispatch(item, dry_run):
     return accepted, run_id, ([] if accepted else _blocking(run_id) if run_id else ["run produced no verdict"])
 
 
-def escalate(item, run_id, blocking):
+DECISIONS = FACTORY_ROOT / "runs" / "decisions.yml"
+
+
+def _queue_decision(item, run_id, blocking, human_brief=None):
+    """Put the escalation in the DECISIONS QUEUE, which is what the observatory serves and what the
+    owner rules from — approving there advances the backlog automatically.
+
+    This module's own docstring has promised "write an evidence bundle to the decisions queue"
+    since it was written, and it never did: escalations only ever became markdown files nobody was
+    told about, so the approvals half of the observatory sat empty and every ruling had to come
+    through hand-edited YAML."""
+    try:
+        data = yaml.safe_load(DECISIONS.read_text()) if DECISIONS.exists() else None
+    except Exception:
+        data = None
+    data = data or {"decisions": []}
+    did = f"{item['id']}-{run_id}" if run_id else item["id"]
+    if any(d.get("id") == did for d in data["decisions"]):
+        return                                    # already queued for this run
+    hb = human_brief or {}
+    data["decisions"].append({
+        "id": did,
+        "backlog_id": item["id"],
+        "kind": "decision" if hb.get("question") else "escalation",
+        "repo": item.get("repo", "—"),
+        "run_id": run_id,
+        "item_note": item.get("note", ""),
+        "finding": hb.get("question") or "; ".join(blocking or []) or "did not reach acceptance",
+        "why": hb.get("why", ""),
+        "options": hb.get("options", []),
+        "recommendation": hb.get("recommendation", ""),
+        "blocking": list(blocking or []),
+        "status": "open",
+    })
+    DECISIONS.parent.mkdir(parents=True, exist_ok=True)
+    DECISIONS.write_text("# Decisions queue — escalations + ratifications awaiting the human.\n"
+                         + yaml.safe_dump(data, sort_keys=False, default_flow_style=False))
+
+
+def escalate(item, run_id, blocking, human_brief=None):
+    _queue_decision(item, run_id, blocking, human_brief)
     ESC_DIR.mkdir(parents=True, exist_ok=True)
     p = ESC_DIR / f"{item['id']}.md"
     lines = [f"# Escalation — {item['id']}", "",
@@ -130,7 +170,8 @@ def escalate(item, run_id, blocking):
     lines += ["", "## To resolve", "1. Rule the finding (usually a DEC in canon, mirroring DEC-052/055/056).",
               f"2. Set this item's `status: ready` in `backlog.yml` (or add a remediation item citing this run).",
               "3. Re-run the orchestrator — it will pick it back up.", "",
-              f"Inspect the full run at http://localhost:7788 → {run_id}"]
+              f"Rule it in the observatory (Decisions tab) — approving there re-opens this item",
+              f"automatically. Run detail: {run_id}"]
     p.write_text("\n".join(lines))
     return p
 

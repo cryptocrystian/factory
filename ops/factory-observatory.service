@@ -1,0 +1,21 @@
+[Unit]
+Description=Factory observatory — runs, live phases, and the decisions queue the owner rules from
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/factory
+Environment=TERM=dumb
+Environment=HOME=/root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin
+# Bound to the TAILNET address only — reachable from the owner's workstation over the private
+# overlay, never from the public internet. The dashboard exposes run traces and an approvals API
+# that mutates the backlog, so it must not be open to the world.
+ExecStart=/root/.local/bin/uv run observe.py --host 100.103.168.32 --port 7788
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
