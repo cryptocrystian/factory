@@ -20,6 +20,28 @@ from pathlib import Path
 import yaml
 
 
+KEEP_SNAPSHOTS = 20
+
+
+def _snapshot(path: Path) -> None:
+    """Copy the current contents aside before overwriting. Best-effort: never block a write."""
+    try:
+        if not path.exists():
+            return
+        hist = path.parent / ".history"
+        hist.mkdir(exist_ok=True)
+        stamp = f"{path.name}.{int(os.path.getmtime(path))}"
+        target = hist / stamp
+        if not target.exists():
+            target.write_bytes(path.read_bytes())
+        keep = sorted(hist.glob(f"{path.name}.*"))[-KEEP_SNAPSHOTS:]
+        for old_file in sorted(hist.glob(f"{path.name}.*"))[:-KEEP_SNAPSHOTS]:
+            if old_file not in keep:
+                old_file.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _lock_path(path: Path) -> Path:
     return path.with_name(path.name + ".lock")
 
@@ -55,6 +77,11 @@ def update(path: Path, mutate, header: str = "", default=None):
             if out is None:
                 out = data
             body = (header or "") + yaml.safe_dump(out, sort_keys=False, default_flow_style=False)
+            # Keep a short rolling history. backlog.yml is LIVE runtime state that also happens to be
+            # tracked in git, so an ordinary `git checkout -- .` silently reverts the whole queue to
+            # whenever it was last committed — which happened on 2026-08-21 and re-dispatched
+            # already-accepted journeys. Recovery should be seconds, not reconstruction from memory.
+            _snapshot(path)
             # Atomic replace: a reader never sees a half-written queue.
             fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
             try:
