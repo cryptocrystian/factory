@@ -160,6 +160,7 @@ def verify_governance() -> None:
         ln = feat.Lane.__new__(feat.Lane)
         ln.repo = scratch; ln.journey = "VERIFY"; ln.runner = None; ln.live = True
         ln.design = None; ln._agent_gates_ok = True; ln._last_breach = []; ln._human_brief = None
+        ln._review_cycles = 0; ln._seen_findings = []
         ln._agent = agent_impl.__get__(ln)
         ln._converge = (lambda self, r, f, u: converge).__get__(ln)
         ln._review = (lambda self, r: (False, ["blocking"], None)).__get__(ln)
@@ -391,6 +392,67 @@ def verify_phase_intent() -> None:
         check(True, "an unknown role fails fast, before any agent spawns")
 
 
+def verify_loop_governance() -> None:
+    """The four fixes from the JRN-B1 post-mortem: thirteen review cycles, five hours, and two
+    journeys both authoring migration 0012."""
+    import importlib.util as _il, os as _os, time as _time
+    spec = _il.spec_from_file_location("feat_g", ROOT / "lanes" / "feature.py")
+    feat = _il.module_from_spec(spec); spec.loader.exec_module(feat)
+
+    # 1. protected-path findings route to the architect instead of the builder
+    check(feat.needs_protected_path(["0012_bqs.sql is absent, so the required RPCs are missing"]),
+          "a missing-migration finding is recognised as architect work")
+    check(feat.needs_protected_path(["canon/ does not define the stage ladder"]),
+          "a canon finding is recognised as architect work")
+    check(not feat.needs_protected_path(["the button label is wrong", "add a unit test"]),
+          "an ordinary app finding still goes to the builder")
+
+    # 2. the run-wide review ceiling sits over the nested loops
+    check(feat.MAX_REVIEW_CYCLES < feat.MAX_FIX_ITERS * feat.MAX_ARCH_ROUNDS,
+          "the review ceiling binds before the nested loops can",
+          f"{feat.MAX_REVIEW_CYCLES} < {feat.MAX_FIX_ITERS}x{feat.MAX_ARCH_ROUNDS}")
+
+    class T:
+        def __init__(self): self.events = []
+        def log(self, **kw): self.events.append(kw)
+    class R:
+        def __init__(self): self.tracer = T()
+    lane = feat.Lane.__new__(feat.Lane)
+    lane._review_cycles = 0; lane._seen_findings = []
+    r = R(); r._started_at = _time.monotonic()
+    check(not lane._budget_spent(r), "a fresh run has budget")
+    lane._review_cycles = feat.MAX_REVIEW_CYCLES
+    check(lane._budget_spent(r), "the run stops at its review ceiling")
+
+    # 3. the same finding twice is a loop that is not converging
+    lane._review_cycles = 2; lane._seen_findings = ["same"] * (feat.NO_PROGRESS_REPEATS + 1)
+    r2 = R(); r2._started_at = _time.monotonic()
+    check(lane._budget_spent(r2), "a repeated finding stops the loop")
+    check(any(e.get("event_detail") == "no_progress" for e in r2.tracer.events),
+          "the non-progress stop is recorded")
+
+    # 4. a run that runs too long stops, whatever its loops say
+    lane._review_cycles = 0; lane._seen_findings = []
+    r3 = R(); r3._started_at = _time.monotonic() - (feat.MAX_RUN_WALL_S + 60)
+    check(lane._budget_spent(r3), "a run past its wall clock stops")
+
+    # 5. the migration claim reaches the architect's prompt
+    _os.environ["FACTORY_MIGRATION_CLAIM"] = "0042"
+    note = feat._migration_claim_note()
+    check("0042_" in note and "parallel" in note, "the architect is told which migration number it owns")
+    _os.environ.pop("FACTORY_MIGRATION_CLAIM")
+    check(feat._migration_claim_note() == "", "no claim, no instruction")
+
+    # 6. the scheduler hands concurrent runs DIFFERENT numbers
+    spec2 = _il.spec_from_file_location("orch_g", ROOT / "orchestrator.py")
+    orch = _il.module_from_spec(spec2); spec2.loader.exec_module(orch)
+    first = orch.claim_migration_number({"repo": "arxus"}, [])
+    second = orch.claim_migration_number({"repo": "arxus"}, [first])
+    check(first != second, "two concurrent journeys claim different migration numbers",
+          f"{first} then {second}")
+    check(int(second) == int(first) + 1, "claims are sequential")
+
+
 def verify_selftest() -> None:
     rc, out = run(["uv", "run", str(ROOT / "control-plane" / "selftest_k1.py")])
     check(rc == 0 and "ALL PASS" in out, "K1 adapter-spine self-test",
@@ -425,6 +487,7 @@ def main(argv: list[str]) -> int:
     verify_meter()
     verify_stale_green()
     verify_phase_intent()
+    verify_loop_governance()
     verify_replay(repo)
     if a.with_docker:
         verify_docker(repo)

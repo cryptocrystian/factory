@@ -14,6 +14,7 @@ Replay (feeds recorded P0 envelopes through the same control plane — the golde
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from dataclasses import dataclass, replace
@@ -24,6 +25,46 @@ sys.path.insert(0, str(CP))
 
 # Every role this lane can call. Validated before a run spawns anything (hard rule 1).
 LANE_ROLES = ("planner", "builder", "test-author", "reviewer", "architect", "product-manager")
+
+# A run's TOTAL review budget. MAX_FIX_ITERS and MAX_ARCH_ROUNDS bound their own loops, but they
+# NEST: 4 architect rounds each running a 3-iteration fix loop is 12+ review cycles, all "within
+# bounds". JRN-B1 spent thirteen of them and half a week of judge quota on 2026-08-20. The loops
+# needed a ceiling over them, not tighter individual limits.
+MAX_REVIEW_CYCLES = 8
+# A run's own ceiling. Per-phase wall caps bound a PHASE; nothing bounded the run, so JRN-B1 passed
+# five hours without anything noticing. A run this long is not converging, whatever its loops say.
+MAX_RUN_WALL_S = 3 * 60 * 60
+# The same blocking finding coming back twice means the loop is not converging — grinding a third
+# time costs quota and learns nothing.
+NO_PROGRESS_REPEATS = 2
+
+# A finding naming one of these is the ARCHITECT's work by definition: the builder is structurally
+# barred from protected paths, so sending it there first guarantees a wasted cycle.
+PROTECTED_PATH_HINTS = ("migration", ".sql", "supabase/migrations", "canon/")
+
+
+def needs_protected_path(findings) -> bool:
+    """True when the blocking findings cannot be closed without writing a protected path."""
+    text = " ".join(str(f) for f in (findings or [])).lower()
+    return any(h in text for h in PROTECTED_PATH_HINTS)
+
+
+def _migration_claim_note() -> str:
+    """The migration number this run owns. Concurrent journeys each get their own, so two runs
+    branching off the same main cannot both author `0012` — which is exactly what JRN-S4 and
+    JRN-B1 did on 2026-08-20."""
+    claim = os.environ.get("FACTORY_MIGRATION_CLAIM", "").strip()
+    if not claim:
+        return ""
+    return (f"MIGRATION NUMBER: this run owns `{claim}`. If you author a migration it MUST be named "
+            f"`{claim}_<slug>.sql` — another journey may be running in parallel off the same base "
+            f"and holds the adjacent numbers. Never take 'the next number' by listing the directory. ")
+
+
+def _fingerprint(findings) -> str:
+    """What the reviewer is blocking on, normalised — for detecting a loop that is not moving."""
+    return "|".join(sorted(str(f).strip().lower()[:120] for f in (findings or [])))
+
 
 MAX_FIX_ITERS = 3          # bounded builder fix loop (I9): converge or escalate
 MAX_ARCH_ROUNDS = 4        # bounded architect authority loop: enough rounds to close a lockdown cascade
@@ -155,6 +196,9 @@ class Lane:
         self._agent_gates_ok = True   # agent-phase gates enforce on live runs (reset per pass/fix-iter)
         self._last_breach: list[str] = []   # paths a role tried to write outside its grant (rolled back)
         self._human_brief = None
+        self._review_cycles = 0            # total reviews this run — the ceiling over the nested loops
+        self._run_started = time.monotonic()
+        self._seen_findings: list[str] = []
 
     def run(self) -> bool:
         run = Run(self.repo, lane="feature", target=self.journey)
@@ -168,6 +212,7 @@ class Lane:
             return self._abort(run, e)
 
     def _feature_phases(self, run) -> bool:
+        run._started_at = time.monotonic()
         run.meter = meter.RunMeter().open()
         # -- resolve (I7: canon gap halts) ------------------------------------
         with run.phase(E.PhaseParams(name="resolve", kind="code", owner="canon",
@@ -197,7 +242,16 @@ class Lane:
         approved, findings, review = self._review(run)
         accepted = l0_ok and unit_ok[0] and approved and self._agent_gates_ok
         if not accepted:
-            accepted = self._converge(run, findings, unit_ok[1])
+            # ROUTE BY FINDING CLASS, NOT BY EXHAUSTION. The builder is structurally barred from
+            # migrations and canon, so a finding naming one cannot be closed by the fix loop —
+            # sending it there anyway burns three builder cycles and three reviews to learn what
+            # the finding already said. That ordering is how JRN-B1 reached thirteen review cycles
+            # against a reviewer repeating "0012_bqs.sql is absent".
+            if self.live and needs_protected_path(findings):
+                run.tracer.log(event_detail="routed_to_architect_first", blocking=findings)
+                accepted = self._architect_resolve(run)
+            else:
+                accepted = self._converge(run, findings, unit_ok[1])
         # The builder can't write protected paths (migrations, canon). When it can't converge, the
         # architect — the authority over those paths — takes over: it resolves technical findings
         # against canon and escalates only genuine business/product decisions. This is what closes
@@ -374,12 +428,42 @@ class Lane:
         # always a real one — no synthetic "no review envelope" finding ever reaches the builder.
         approved = bool(getattr(review, "approved", False))
         blocking = list(getattr(review, "blocking", []) or [])
-        run.tracer.log(event_detail="review_verdict", approved=approved, blocking=blocking)
+        self._review_cycles = getattr(self, "_review_cycles", 0) + 1
+        if not approved:
+            self._seen_findings = getattr(self, "_seen_findings", []) + [_fingerprint(blocking)]
+        run.tracer.log(event_detail="review_verdict", approved=approved, blocking=blocking,
+                       cycle=self._review_cycles)
         return approved, blocking, review
+
+    def _budget_spent(self, run) -> bool:
+        """Has this run used its whole review budget, or stopped making progress? Either way,
+        continuing costs quota and learns nothing — stop and let the ladder escalate."""
+        started = getattr(run, "_started_at", None)
+        if started and (time.monotonic() - started) > MAX_RUN_WALL_S:
+            run.tracer.log(event_detail="run_wall_exceeded",
+                           elapsed_min=int((time.monotonic() - started) / 60))
+            return True
+        if getattr(self, "_review_cycles", 0) >= MAX_REVIEW_CYCLES:
+            run.tracer.log(event_detail="review_budget_exhausted", cycles=self._review_cycles)
+            return True
+        seen = getattr(self, "_seen_findings", [])
+        fp = seen[-1] if seen else ""
+        if fp and seen.count(fp) > NO_PROGRESS_REPEATS:
+            run.tracer.log(event_detail="no_progress", repeats=seen.count(fp),
+                           finding=fp[:160])
+            return True
+        return False
 
     def _converge(self, run, findings, unit_evidence) -> bool:
         """Bounded fix loop: re-route findings + failing-gate output to the builder until accepted."""
         for i in range(1, MAX_FIX_ITERS + 1):
+            if self._budget_spent(run):
+                return False
+            if needs_protected_path(findings):
+                # Handing this back to the builder cannot work: it may not write the path the
+                # finding names. Yield to the authority that can.
+                run.tracer.log(event_detail="fix_loop_yields_to_architect", blocking=findings)
+                return False
             run.tracer.log(event_detail="fix_iter", i=i, findings=findings)
             self._agent_gates_ok = True        # this iteration's builder/reviewer gates must pass
             fixmd = "# Findings to close\n\n" + "\n".join(f"- {f}" for f in findings)
@@ -424,11 +508,14 @@ class Lane:
         if approved and self._retest(run):                 # never accept on a stale green (§6.5)
             return True
         for i in range(1, MAX_ARCH_ROUNDS + 1):
+            if self._budget_spent(run):
+                return self._unresolved(run)
             (run.dir / f"arch-findings-{i}.md").write_text(
                 "# Blocking findings the builder could not close\n\n" + "\n".join(f"- {f}" for f in findings))
             arch = self._agent(run, "architect", "architect",
                 intent=f"Round {i}: author the migration or canon decision the builder may not write",
-                prompt=(f"The builder's fix loop could not close the findings in arch-findings-{i}.md "
+                prompt=(_migration_claim_note()
+                        + f"The builder's fix loop could not close the findings in arch-findings-{i}.md "
                         "(added run dir) — they require a protected path only you may write (a database "
                         "migration or a canonical decision). Read context.md for governing canon. Triage "
                         "each finding; resolve the technical ones by authoring the migration/decision that "

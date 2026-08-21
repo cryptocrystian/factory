@@ -16,6 +16,7 @@ waiting on your ruling — the human decides, the human doesn't dispatch.
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -64,6 +65,25 @@ def ready(items):
 
 
 # ----------------------------------------------------------------------------- dispatch
+def claim_migration_number(item, held_claims) -> str:
+    """Reserve the next migration number for THIS run, accounting for runs already in flight.
+
+    Migration filenames are a shared, ordered resource that no canon binding covers. The
+    decomposition gate correctly ran JRN-S4 and JRN-B1 in parallel — their `Touches` sets are
+    disjoint — but both then authored `0012`, because each read the same `main` and each took
+    "the next number". The gate schedules on entities; the sequence needs claiming too.
+
+    Claims are per dispatch and held for the life of the run, so two concurrent journeys get
+    0012 and 0013 rather than 0012 twice."""
+    try:
+        migdir = Path(repo_path(item["repo"])) / "supabase" / "migrations"
+        used = {int(f.name[:4]) for f in migdir.glob("[0-9][0-9][0-9][0-9]_*.sql")} if migdir.is_dir() else set()
+    except Exception:
+        used = set()
+    used |= {int(n) for n in held_claims if str(n).isdigit()}
+    return f"{(max(used) + 1) if used else 1:04d}"
+
+
 def _cmd(item):
     repo = repo_path(item["repo"])
     if item["kind"] == "journey":
@@ -350,6 +370,7 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
     merge_retries: dict[str, int] = {}
     infra_retries: dict[str, int] = {}                 # transient (model overloaded / no envelope) retries
     judge = JudgeGate()                                # preflight: is the reviewer family up?
+    migration_claims: dict[str, str] = {}              # item_id -> reserved migration number
     retry_after: dict[str, float] = {}                 # item_id -> monotonic time before which not to redispatch
     conflicts = 0                                      # merge-conflict feedback (should stay near zero)
     # A prior daemon may have died mid-flight; systemd's cgroup kill takes its children too, so any
@@ -367,6 +388,7 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
             if proc.poll() is None:
                 continue
             del inflight[iid]
+            migration_claims.pop(iid, None)             # claim released with the run
             item = by_id.get(iid)
             if not item:
                 continue
@@ -439,8 +461,11 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
                 print(f"  ⋯ hold      {item['id']}  (bindings {sorted(b)} overlap in-flight — serialized)", flush=True)
                 continue                               # decomposition gate: serialize, don't collide
             item["status"] = "in_progress"
+            claim = claim_migration_number(item, migration_claims.values())
+            migration_claims[item["id"]] = claim
             # children stay in the daemon's cgroup, so systemd stop/restart reaps them (no orphans)
-            proc = subprocess.Popen(_cmd(item), cwd=str(FACTORY_ROOT))
+            proc = subprocess.Popen(_cmd(item), cwd=str(FACTORY_ROOT),
+                                    env={**os.environ, "FACTORY_MIGRATION_CLAIM": claim})
             inflight[item["id"]] = (proc, b)
             held.append(b)
             print(f"  ▶ dispatch  {item['id']}  ({item['kind']}) bindings={sorted(b)} "
