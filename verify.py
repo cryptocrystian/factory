@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -525,6 +526,44 @@ def verify_shipping_and_concurrency() -> None:
     check("cycle failed" in orch, "a failing cycle is reported")
 
 
+def verify_orchestration_table_stakes() -> None:
+    """The two things any orchestration layer owes: work that is queued and CHECKED before it runs,
+    and output that is actually delivered. Both were missing until 2026-08-21."""
+    sys.path.insert(0, str(ROOT / "control-plane"))
+    import readiness  # noqa: E402
+    import importlib.util as _il
+    spec = _il.spec_from_file_location("orch_t", ROOT / "orchestrator.py")
+    orch = _il.module_from_spec(spec); spec.loader.exec_module(orch)
+
+    # readiness: entity -> table, including prefixed forms
+    check(readiness.table_name("BQSScore") == "bqs_score", "ontology entities map to table names")
+    check(readiness.table_name("VerificationRecord") == "verification_record", "compound entities map")
+
+    repo = Path(os.path.expanduser("~/projects/arxus"))
+    if repo.is_dir():
+        r = readiness.check(repo, "JRN-S4")
+        check(r.ready, "a shipped journey reads as ready", "; ".join(r.blocking())[:70])
+        r2 = readiness.check(repo, "JRN-G2")
+        check(not r2.ready and r2.missing_tables,
+              "a journey whose canon names a table that does not exist is caught BEFORE dispatch",
+              "; ".join(r2.blocking())[:70])
+        check("Author them first" in r2.brief(), "the gap is handed over as architect work")
+        r3 = readiness.check(repo, "JRN-NOPE")
+        check(not r3.ready, "an unknown journey is never dispatched")
+
+    src = (ROOT / "orchestrator.py").read_text()
+    check("readiness.check" in src, "the daemon runs the canon check before every dispatch")
+    check("FACTORY_READINESS_BRIEF" in src, "the gaps travel into the run")
+    lane = (ROOT / "lanes" / "feature.py").read_text()
+    check("readiness_gaps_in_context" in lane, "the run's context carries them to the planner")
+
+    # delivery: unshipped or stale repos do not get new work
+    check(hasattr(orch, "delivery_state"), "the daemon knows whether its output is shipped")
+    check("dispatch_blocked" in src, "an unshipped repo is not given new work")
+    check("NOT shipped" in src and "stale base" in src,
+          "ahead and behind are both refused, for different reasons")
+
+
 def verify_selftest() -> None:
     rc, out = run(["uv", "run", str(ROOT / "control-plane" / "selftest_k1.py")])
     check(rc == 0 and "ALL PASS" in out, "K1 adapter-spine self-test",
@@ -562,6 +601,7 @@ def main(argv: list[str]) -> int:
     verify_loop_governance()
     verify_escalation_payload()
     verify_shipping_and_concurrency()
+    verify_orchestration_table_stakes()
     verify_replay(repo)
     if a.with_docker:
         verify_docker(repo)

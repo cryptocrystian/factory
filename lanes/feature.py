@@ -237,7 +237,21 @@ class Lane:
             if bundle.gaps and any("not found" in g for g in bundle.gaps):
                 run.tracer.log(event_detail="canon_gap", gaps=bundle.gaps)
                 return run.finish(False, reason=f"canon gap: {bundle.gaps}")
-            (run.dir / "context.md").write_text(bundle.markdown())
+            context = bundle.markdown()
+            # Readiness gaps the orchestrator proved BEFORE dispatch. Putting them in context means
+            # the planner plans the substrate and the first review names a protected path — which
+            # routes straight to the architect, instead of the builder rediscovering it for three
+            # cycles the way JRN-B1 did.
+            brief = os.environ.get("FACTORY_READINESS_BRIEF", "").strip()
+            if brief and Path(brief).is_file():
+                context += "\n\n---\n\n" + Path(brief).read_text()
+                run.tracer.log(event_detail="readiness_gaps_in_context", brief=brief)
+            claim = os.environ.get("FACTORY_MIGRATION_CLAIM", "").strip()
+            if claim:
+                context += (f"\n\n## Migration number\n\nThis run owns `{claim}`. Any migration "
+                            f"MUST be named `{claim}_<slug>.sql` — a parallel journey holds the "
+                            f"adjacent numbers.\n")
+            (run.dir / "context.md").write_text(context)
             ph.ok()
 
         # -- plan (writes plan.md into the run dir; not committed to the repo) --

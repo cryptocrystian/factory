@@ -30,6 +30,7 @@ ESC_DIR = FACTORY_ROOT / "runs" / "escalations"
 CP = FACTORY_ROOT / "control-plane"
 sys.path.insert(0, str(CP))
 import obsdb
+import readiness
 import statefile
 import notifier as notifier_mod
 import canon
@@ -89,6 +90,34 @@ def ready(items):
 
 
 # ----------------------------------------------------------------------------- dispatch
+def delivery_state(repo: str) -> tuple[bool, str]:
+    """Is this repo's work actually SHIPPED — local base branch equal to its remote?
+
+    Table stakes the orchestrator was not doing: JRN-S4's accepted merge sat unpushed on the box for
+    a day while the handoff claimed GitHub was the origin of truth. Dispatching onto an out-of-sync
+    repo also guarantees the next merge either strands too or loses the base-moved check (I11)."""
+    try:
+        path = Path(repo_path(repo))
+        branch = _git_out(path, "rev-parse", "--abbrev-ref", "HEAD")
+        _git_out(path, "fetch", "--quiet", "origin", branch)
+        counts = _git_out(path, "rev-list", "--left-right", "--count", f"origin/{branch}...HEAD")
+        behind, ahead = (int(x) for x in counts.split())
+    except Exception as ex:
+        return True, f"delivery state unknown ({type(ex).__name__}) — proceeding"
+    if ahead and behind:
+        return False, f"{repo} has DIVERGED from origin/{branch} (+{ahead}/-{behind}) — reconcile before dispatch"
+    if ahead:
+        return False, f"{repo} is {ahead} commit(s) ahead of origin/{branch} — accepted work is NOT shipped"
+    if behind:
+        return False, f"{repo} is {behind} commit(s) behind origin/{branch} — runs would start from a stale base"
+    return True, f"{repo} in sync with origin/{branch}"
+
+
+def _git_out(path: Path, *args) -> str:
+    return subprocess.run(["git", *args], cwd=str(path), capture_output=True, text=True,
+                          check=True, timeout=120).stdout.strip()
+
+
 def claim_migration_number(item, held_claims) -> str:
     """Reserve the next migration number for THIS run, accounting for runs already in flight.
 
@@ -403,6 +432,8 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
     judge = JudgeGate()                                # preflight: is the reviewer family up?
     migration_claims: dict[str, str] = {}              # item_id -> reserved migration number
     cycle_failures = 0                                 # consecutive cycles that raised
+    delivery_warned: dict[str, str] = {}               # repo -> last delivery warning printed
+    dispatch_blocked: set[str] = set()                 # repos whose work is not shipped
     retry_after: dict[str, float] = {}                 # item_id -> monotonic time before which not to redispatch
     conflicts = 0                                      # merge-conflict feedback (should stay near zero)
     # A prior daemon may have died mid-flight; systemd's cgroup kill takes its children too, so any
@@ -491,7 +522,22 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
             # conflicting run to finish — instead of racing to a merge conflict. This is what makes it
             # the designed `allocate` step rather than a naive parallel loop.
             held = [b for (_p, b) in inflight.values()]    # bindings currently in flight
+                # DELIVERY GATE. One check per cycle per repo: refuse to start new work on a repo whose
+            # accepted output has not reached its remote, or that is behind it. Shipping is part of
+            # the job, not an afterthought.
+            for _repo in {i.get("repo") for i in ready(items) if i.get("repo")}:
+                ok_sync, why = delivery_state(_repo)
+                if not ok_sync:
+                    if delivery_warned.get(_repo) != why:
+                        delivery_warned[_repo] = why
+                        print(f"  ⚠ delivery   {why}", flush=True)
+                    dispatch_blocked.add(_repo)
+                else:
+                    dispatch_blocked.discard(_repo)
+                    delivery_warned.pop(_repo, None)
+
             dispatchable = [i for i in ready(items) if i["id"] not in inflight
+                            and i.get("repo") not in dispatch_blocked
                             and retry_after.get(i["id"], 0) <= time.monotonic()]
             # Nothing is dispatched while the judge family is down — a build that cannot be reviewed is
             # spend with no possible outcome. Checked only when there is actually something to dispatch.
@@ -507,12 +553,34 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
                 if any(_overlaps(b, h) for h in held):
                     print(f"  ⋯ hold      {item['id']}  (bindings {sorted(b)} overlap in-flight — serialized)", flush=True)
                     continue                               # decomposition gate: serialize, don't collide
+                # FRONT-END CANON CHECK. Resolve the journey against the schema BEFORE spending a
+                # run on it: JRN-B1 burned five hours and thirteen review cycles rediscovering that
+                # its migration and RPCs did not exist. A gap found here is architect work, stated
+                # up front, and it travels into the run so the first review already knows.
+                brief_path = ""
+                if item.get("kind") == "journey":
+                    try:
+                        rep = readiness.check(Path(repo_path(item["repo"])), _target_of(item))
+                    except Exception:
+                        rep = None
+                    if rep is not None and not rep.ready:
+                        bdir = FACTORY_ROOT / "runs" / "readiness"
+                        bdir.mkdir(parents=True, exist_ok=True)
+                        bp = bdir / f"{item['id']}.md"
+                        bp.write_text(rep.brief())
+                        brief_path = str(bp)
+                        print(f"  \u26a0 readiness  {item['id']} starts with "
+                              f"{len(rep.blocking())} known substrate gap(s) — handed to the run up "
+                              f"front, not discovered by review", flush=True)
+                        for gap in rep.blocking()[:3]:
+                            print(f"       · {gap}", flush=True)
                 item["status"] = "in_progress"; pending[item["id"]] = {"status": "in_progress"}
                 claim = claim_migration_number(item, migration_claims.values())
                 migration_claims[item["id"]] = claim
                 # children stay in the daemon's cgroup, so systemd stop/restart reaps them (no orphans)
                 proc = subprocess.Popen(_cmd(item), cwd=str(FACTORY_ROOT),
-                                        env={**os.environ, "FACTORY_MIGRATION_CLAIM": claim})
+                                        env={**os.environ, "FACTORY_MIGRATION_CLAIM": claim,
+                                         "FACTORY_READINESS_BRIEF": brief_path})
                 inflight[item["id"]] = (proc, b)
                 held.append(b)
                 print(f"  ▶ dispatch  {item['id']}  ({item['kind']}) bindings={sorted(b)} "
