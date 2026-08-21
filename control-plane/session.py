@@ -98,9 +98,14 @@ class Run:
         result = accepted and res.merged
         if accepted and not res.merged:
             reason = ((reason + " | ") if reason else "") + (res.error or "accepted but merge did not complete")
-        self.tracer.log(event_detail="finish", accepted=accepted, merged=res.merged, result=result,
+        # A merge that never reached the remote is not shipped. Keep the branch and say so loudly:
+        # silence here is what stranded JRN-S4's entire build on one box for a day.
+        if res.merged and res.pushed is False:
+            self.tracer.log(event_detail="merge_not_pushed", error=res.error, branch=self.work_branch)
+        self.tracer.log(event_detail="finish", accepted=accepted, merged=res.merged,
+                        pushed=res.pushed, result=result,
                         reason=reason, work_branch=self.work_branch, cost_usd=self.tracer.total_cost())
-        self._iso.destroy(keep_branch=not result)
+        self._iso.destroy(keep_branch=not (result and res.pushed is not False))
         return result
 
 

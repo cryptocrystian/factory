@@ -29,6 +29,7 @@ BACKLOG = FACTORY_ROOT / "backlog.yml"
 CP = FACTORY_ROOT / "control-plane"
 sys.path.insert(0, str(CP))
 import obsdb
+import statefile
 
 
 # ----------------------------------------------------------------------------- drill-down
@@ -107,33 +108,52 @@ def load_decisions():
     return yaml.safe_load(DECISIONS.read_text()) or {"decisions": []}
 
 
+DECISIONS_HEADER = "# Decisions queue — escalations + ratifications awaiting the human.\n"
+
+
 def save_decisions(data):
-    DECISIONS.write_text("# Decisions queue — escalations + ratifications awaiting the human, with copilot analysis.\n"
-                         + yaml.safe_dump(data, sort_keys=False, default_flow_style=False))
+    """Whole-file write kept only for callers that already hold the current data; prefer
+    `statefile.update` so a concurrent daemon write cannot lose a ruling."""
+    statefile.update(DECISIONS, lambda _cur: data, header=DECISIONS_HEADER, default={"decisions": []})
 
 
 def record_decision(did, action, note):
+    """A human ruling. Both the ruling and the backlog advance are applied to what is ON DISK NOW,
+    under a lock: the daemon rewrites the backlog every 20 seconds, and before 2026-08-21 an
+    approval landing inside that window was silently erased."""
     """Record a human ruling: update the decision, and advance the backlog item when all its
     decisions are resolved (a fix/launch-gate approval sets the item ready; a reject leaves it)."""
-    data = load_decisions()
-    dec = next((d for d in data["decisions"] if d["id"] == did), None)
-    if not dec:
+    status = ("approved" if action and not action.lower().startswith(("reject", "defer"))
+              else (action or "rejected").lower().split()[0])
+    captured: dict = {}
+
+    def _rule(cur):
+        for d in cur.get("decisions", []):
+            if d["id"] == did:
+                d["status"] = status
+                d["human_action"] = action
+                d["human_note"] = note
+                captured.update(d)
+        return cur
+
+    data = statefile.update(DECISIONS, _rule, header=DECISIONS_HEADER, default={"decisions": []})
+    if not captured:
         return {"error": "unknown decision"}
-    dec["status"] = "approved" if action and not action.lower().startswith(("reject", "defer")) else action.lower().split()[0]
-    dec["human_action"] = action
-    dec["human_note"] = note
-    save_decisions(data)
+    dec = captured
     # advance the backlog if every decision for this item is now approved
     bid = dec.get("backlog_id")
     if bid and BACKLOG.exists():
         siblings = [d for d in data["decisions"] if d.get("backlog_id") == bid]
         if all(s["status"] == "approved" for s in siblings):
-            bl = yaml.safe_load(BACKLOG.read_text()) or {}
-            for it in bl.get("items", []):
-                if it["id"] == bid and it.get("kind") != "decision":
-                    it["status"] = "ready"       # re-open for the orchestrator once the ruling lands
-            BACKLOG.write_text("# Factory backlog — the orchestrator's work queue.\n"
-                               + yaml.safe_dump(bl, sort_keys=False))
+            def _reopen(bl):
+                for it in bl.get("items", []):
+                    if it["id"] == bid and it.get("kind") != "decision":
+                        it["status"] = "ready"   # re-open for the orchestrator once the ruling lands
+                return bl
+
+            statefile.update(BACKLOG, _reopen,
+                             header="# Factory backlog — the orchestrator's work queue.\n",
+                             default={"items": []})
     return {"ok": True, "decision": dec}
 
 

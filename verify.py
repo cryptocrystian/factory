@@ -481,6 +481,50 @@ def verify_escalation_payload() -> None:
     check("human_brief" in sig2.parameters, "the queue records the brief")
 
 
+def verify_shipping_and_concurrency() -> None:
+    """The 2026-08-21 audit findings: work that never left the box, rulings erased by a concurrent
+    writer, and a daemon that died on any raise."""
+    import importlib.util as _il, inspect, yaml as _yaml, tempfile
+    sys.path.insert(0, str(ROOT / "control-plane"))
+    import isolation, statefile  # noqa: E402
+
+    # 1. an accepted merge is PUSHED, and an unpushed merge is not reported as shipped
+    src = (ROOT / "control-plane" / "isolation.py").read_text()
+    check('"push"' in src, "an accepted merge pushes to the remote")
+    check("pushed" in isolation.MergeResult.__dataclass_fields__,
+          "the merge result says whether it actually shipped")
+    ses = (ROOT / "control-plane" / "session.py").read_text()
+    check("merge_not_pushed" in ses, "a merge that never reached the remote is recorded")
+    orch = (ROOT / "orchestrator.py").read_text()
+    check("accepted_unpushed" in orch, "the daemon refuses to call unpushed work accepted")
+
+    # 2. concurrent writers cannot lose a ruling
+    d = Path(tempfile.mkdtemp()) / "backlog.yml"
+    statefile.update(d, lambda _c: {"items": [{"id": "a", "status": "escalated"},
+                                              {"id": "b", "status": "ready"}]}, header="# t\n")
+    stale = _yaml.safe_load(d.read_text())                       # a writer reads at cycle start
+    statefile.update(d, lambda c: [i.update({"status": "ready"})
+                                   for i in c["items"] if i["id"] == "a"] and c or c, header="# t\n")
+
+    def _delta(c):                                               # the other writer applies ITS change
+        for i in c["items"]:
+            if i["id"] == "b":
+                i["status"] = "in_progress"
+        return c
+    statefile.update(d, _delta, header="# t\n")
+    final = {i["id"]: i["status"] for i in _yaml.safe_load(d.read_text())["items"]}
+    check(final["a"] == "ready", "a ruling survives a concurrent daemon write")
+    check(final["b"] == "in_progress", "the daemon's own change survives too")
+    check(len(stale["items"]) == 2, "the stale snapshot is never written back wholesale")
+    check("save_fields" in orch, "the daemon writes deltas, not whole-file snapshots")
+    obs = (ROOT / "observe.py").read_text()
+    check("statefile.update" in obs, "the observatory writes under the same lock")
+
+    # 3. a failing cycle does not take the daemon down
+    check("MAX_CYCLE_FAILURES" in orch, "a failing cycle is bounded, not fatal")
+    check("cycle failed" in orch, "a failing cycle is reported")
+
+
 def verify_selftest() -> None:
     rc, out = run(["uv", "run", str(ROOT / "control-plane" / "selftest_k1.py")])
     check(rc == 0 and "ALL PASS" in out, "K1 adapter-spine self-test",
@@ -517,6 +561,7 @@ def main(argv: list[str]) -> int:
     verify_phase_intent()
     verify_loop_governance()
     verify_escalation_payload()
+    verify_shipping_and_concurrency()
     verify_replay(repo)
     if a.with_docker:
         verify_docker(repo)

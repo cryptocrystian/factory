@@ -35,6 +35,7 @@ def _git(repo: Path, *args: str) -> str:
 class MergeResult:
     merged: bool
     error: str | None = None
+    pushed: bool | None = None      # None = not attempted (rejected merge); False = merged, not shipped
 
 
 class IsolatedWorkspace:
@@ -45,6 +46,7 @@ class IsolatedWorkspace:
                  branch: str, base_branch: str, base_commit: str, symlinks: list[Path]):
         self.adapter = adapter
         self.origin = Path(origin)
+        self.remote = "origin"        # where an accepted merge is shipped
         self.path = Path(path)
         self.branch = branch
         self.base_branch = base_branch
@@ -122,9 +124,21 @@ class WorktreeIsolation:
             # the branch is checked out in the worktree, which git permits for a merge source).
             _git(ws.origin, "-c", "commit.gpgsign=false", "merge", "--no-ff", "-q",
                  "-m", f"merge {ws.branch} (accepted)", ws.branch)
-            return MergeResult(merged=True)
         except GitError as e:
             return MergeResult(merged=False, error=str(e))
+        # PUSH. Without this the merge lands on the box's local branch and stops there: JRN-S4's
+        # entire accepted build — ten commits, a migration, 3,800 lines — sat only on the VPS until
+        # 2026-08-21, while the handoff claimed GitHub was the origin of truth. A merge nobody else
+        # can see is not shipped, and a lost box loses the work.
+        #
+        # The merge itself has already committed, so a push failure is REPORTED, not raised: the
+        # work is safe locally and a later push (or the next accepted merge) carries it. What must
+        # never happen is a silent success.
+        try:
+            _git(ws.origin, "push", ws.remote, ws.base_branch)
+            return MergeResult(merged=True, pushed=True)
+        except GitError as e:
+            return MergeResult(merged=True, pushed=False, error=f"merged locally but push failed: {e}")
 
     def destroy(self, ws: IsolatedWorkspace, keep_branch: bool = True) -> None:
         for link in ws._symlinks:                            # drop symlinks first (never the targets)

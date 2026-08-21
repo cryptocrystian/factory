@@ -30,11 +30,13 @@ ESC_DIR = FACTORY_ROOT / "runs" / "escalations"
 CP = FACTORY_ROOT / "control-plane"
 sys.path.insert(0, str(CP))
 import obsdb
+import statefile
 import notifier as notifier_mod
 import canon
 import omp
 
 DONE = {"accepted", "done"}
+MAX_CYCLE_FAILURES = 5     # consecutive failing cycles before the daemon gives up and exits loudly
 JUDGE_PROBE_TTL = 600      # seconds a healthy judge-provider probe is trusted before re-checking
 LANE = str(FACTORY_ROOT / "lanes" / "feature.py")
 
@@ -42,6 +44,28 @@ LANE = str(FACTORY_ROOT / "lanes" / "feature.py")
 # ----------------------------------------------------------------------------- backlog
 def load():
     return yaml.safe_load(BACKLOG.read_text()) or {"items": []}
+
+
+BACKLOG_HEADER = "# Factory backlog — the orchestrator's work queue. Edit status to re-open an item.\n"
+
+
+def save_fields(changes: dict):
+    """Write ONLY the fields this process changed, onto what is on disk NOW.
+
+    The daemon used to rewrite the whole backlog from a copy read 20 seconds earlier, which erased
+    any ruling approved in the observatory during that window — the item stayed escalated and was
+    never re-picked. Applying just our own deltas under a lock means the two writers compose."""
+    if not changes:
+        return
+
+    def mutate(data):
+        by_id = {i["id"]: i for i in data.get("items", [])}
+        for iid, fields in changes.items():
+            if iid in by_id:
+                by_id[iid].update(fields)
+        return data
+
+    statefile.update(BACKLOG, mutate, header=BACKLOG_HEADER, default={"items": []})
 
 
 def save(data):
@@ -149,16 +173,9 @@ def _queue_decision(item, run_id, blocking, human_brief=None):
     since it was written, and it never did: escalations only ever became markdown files nobody was
     told about, so the approvals half of the observatory sat empty and every ruling had to come
     through hand-edited YAML."""
-    try:
-        data = yaml.safe_load(DECISIONS.read_text()) if DECISIONS.exists() else None
-    except Exception:
-        data = None
-    data = data or {"decisions": []}
     did = f"{item['id']}-{run_id}" if run_id else item["id"]
-    if any(d.get("id") == did for d in data["decisions"]):
-        return                                    # already queued for this run
     hb = human_brief or {}
-    data["decisions"].append({
+    record = {
         "id": did,
         "backlog_id": item["id"],
         "kind": "decision" if hb.get("question") else "escalation",
@@ -171,10 +188,17 @@ def _queue_decision(item, run_id, blocking, human_brief=None):
         "recommendation": hb.get("recommendation", ""),
         "blocking": list(blocking or []),
         "status": "open",
-    })
-    DECISIONS.parent.mkdir(parents=True, exist_ok=True)
-    DECISIONS.write_text("# Decisions queue — escalations + ratifications awaiting the human.\n"
-                         + yaml.safe_dump(data, sort_keys=False, default_flow_style=False))
+    }
+    def _add(cur):
+        cur.setdefault("decisions", [])
+        if any(d.get("id") == did for d in cur["decisions"]):
+            return cur                       # another writer queued it first
+        cur["decisions"].append(record)
+        return cur
+
+    statefile.update(DECISIONS, _add,
+                     header="# Decisions queue — escalations + ratifications awaiting the human.\n",
+                     default={"decisions": []})
 
 
 def escalate(item, run_id, blocking, human_brief=None):
@@ -248,7 +272,7 @@ def _verdict(target):
     import json
     run = _latest_run(target)
     if not run:
-        return False, False, None, ["run produced no verdict"], False, 0.0, None, {}
+        return False, False, None, ["run produced no verdict"], False, 0.0, None, {}, None
     run_id = run["run_id"]
     conn = obsdb.connect()
     try:
@@ -259,11 +283,13 @@ def _verdict(target):
     cooldown = 0.0
     cost = None
     brief = {}
+    pushed = None
     for e in (r["events"] if r else []):
         d = json.loads(e["detail"]) if e.get("detail") else {}
         ed = d.get("event_detail")
         if ed == "finish":
             accepted = bool(d.get("accepted")); merged = bool(d.get("merged"))
+            pushed = d.get("pushed")
         elif ed in ("architect_not_resolved", "architect_surfaced_decision", "pm_escalated"):
             hb = d.get("human_brief") or ({"question": d.get("question")} if d.get("question") else {})
             if hb.get("question"):
@@ -277,7 +303,7 @@ def _verdict(target):
             transient = True                       # the lane stopped itself: undecidable, not a ruling
             cooldown = max(cooldown, float(d.get("retry_after_s") or 0.0))
     blocking = [] if accepted else _blocking(run_id)
-    return accepted, merged, run_id, blocking, transient, cooldown, cost, brief
+    return accepted, merged, run_id, blocking, transient, cooldown, cost, brief, pushed
 
 
 def _target_of(item):
@@ -376,106 +402,133 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
     infra_retries: dict[str, int] = {}                 # transient (model overloaded / no envelope) retries
     judge = JudgeGate()                                # preflight: is the reviewer family up?
     migration_claims: dict[str, str] = {}              # item_id -> reserved migration number
+    cycle_failures = 0                                 # consecutive cycles that raised
     retry_after: dict[str, float] = {}                 # item_id -> monotonic time before which not to redispatch
     conflicts = 0                                      # merge-conflict feedback (should stay near zero)
     # A prior daemon may have died mid-flight; systemd's cgroup kill takes its children too, so any
     # in_progress item is stale — reset it to ready so it re-runs cleanly.
-    data = load()
-    for it in data["items"]:
-        if it.get("status") == "in_progress":
-            it["status"] = "ready"
-    save(data)
+    def _reset_stale(d):
+        for it in d.get("items", []):
+            if it.get("status") == "in_progress":
+                it["status"] = "ready"
+        return d
+
+    statefile.update(BACKLOG, _reset_stale, header=BACKLOG_HEADER, default={"items": []})
     print(f"▶ daemon up — max_parallel={max_parallel}, poll={poll_s}s, continuous", flush=True)
     while True:
-        data = load(); items = data["items"]; by_id = {i["id"]: i for i in items}
-        # --- reap finished runs ------------------------------------------------
-        for iid, (proc, _b) in list(inflight.items()):
-            if proc.poll() is None:
-                continue
-            del inflight[iid]
-            migration_claims.pop(iid, None)             # claim released with the run
-            item = by_id.get(iid)
-            if not item:
-                continue
-            accepted, merged, run_id, blocking, transient, cooldown, cost, brief = _verdict(_target_of(item))
-            item["paid_usd"] = cost
-            price = "" if cost is None else f"  (${cost:.2f} paid)"
-            item["run_id"] = run_id
-            if accepted and merged:
-                item["status"] = "accepted"
-                print(f"  ✓ accepted  {iid}{price}", flush=True)
-                nt.accepted(project=item.get("repo", "—"), item_id=iid, kind=item["kind"],
-                            note=item.get("note", ""), run_id=run_id)
-            elif (not accepted) and transient:           # infra failure (model overloaded / no envelope)
-                n = infra_retries.get(iid, 0) + 1; infra_retries[iid] = n
-                if n <= 5:
-                    item["status"] = "ready"             # NOT a human escalation — just try again, backed off
-                    # A provider that advertises its own cooldown (a rate limit says "wait 30 min")
-                    # outranks our schedule: retrying inside that window just burns the other family's
-                    # tokens on a run that cannot finish. Cap at an hour so a bogus number can't park
-                    # the queue indefinitely.
-                    back = min(max(min(60 * n, 600), int(cooldown)), 3600)
-                    retry_after[iid] = time.monotonic() + back
-                    why = f"provider cooldown {int(cooldown)}s" if cooldown > min(60 * n, 600) else "transient infra failure"
-                    print(f"  ↻ retry     {iid}  ({why}, attempt {n}, backoff {back}s)", flush=True)
-                else:
-                    item["status"] = "escalated"
-                    escalate(item, run_id, ["repeated transient infra failure (model overloaded / no envelope)"])
+        # A cycle must never take the daemon down with it. Before 2026-08-21 any raise in here —
+        # a malformed backlog, a git hiccup, an unreachable notifier — killed the process; systemd
+        # restarted it, the cgroup kill reaped every in-flight lane, and hours of work vanished with
+        # no record. A failing cycle is now logged and retried; only a persistently broken one stops.
+        try:
+            data = load(); items = data["items"]; by_id = {i["id"]: i for i in items}
+            pending: dict[str, dict] = {}          # only what THIS cycle changed, written under lock
+            # --- reap finished runs ------------------------------------------------
+            for iid, (proc, _b) in list(inflight.items()):
+                if proc.poll() is None:
+                    continue
+                del inflight[iid]
+                migration_claims.pop(iid, None)             # claim released with the run
+                item = by_id.get(iid)
+                if not item:
+                    continue
+                accepted, merged, run_id, blocking, transient, cooldown, cost, brief, pushed = _verdict(_target_of(item))
+                item["paid_usd"] = cost; pending.setdefault(iid, {})["paid_usd"] = cost
+                price = "" if cost is None else f"  (${cost:.2f} paid)"
+                item["run_id"] = run_id; pending.setdefault(iid, {})["run_id"] = run_id
+                if accepted and merged:
+                    item["status"] = "accepted"; pending[iid] = {"status": "accepted"}
+                    print(f"  ✓ accepted  {iid}{price}", flush=True)
+                    if pushed is False:
+                        # Merged locally but the remote never got it. The work is real but unshipped —
+                        # say it every cycle until someone pushes, never let it pass as done.
+                        item["status"] = "accepted_unpushed"; pending[iid] = {"status": "accepted_unpushed"}
+                        print(f"  ⚠ NOT PUSHED {iid} — merged locally only; the remote does not have "
+                              f"this work. Push {item.get('repo','?')} before trusting it shipped.",
+                              flush=True)
+                    nt.accepted(project=item.get("repo", "—"), item_id=iid, kind=item["kind"],
+                                note=item.get("note", ""), run_id=run_id)
+                elif (not accepted) and transient:           # infra failure (model overloaded / no envelope)
+                    n = infra_retries.get(iid, 0) + 1; infra_retries[iid] = n
+                    if n <= 5:
+                        item["status"] = "ready"; pending[iid] = {"status": "ready"}   # NOT an escalation — retry, backed off
+                        # A provider that advertises its own cooldown (a rate limit says "wait 30 min")
+                        # outranks our schedule: retrying inside that window just burns the other family's
+                        # tokens on a run that cannot finish. Cap at an hour so a bogus number can't park
+                        # the queue indefinitely.
+                        back = min(max(min(60 * n, 600), int(cooldown)), 3600)
+                        retry_after[iid] = time.monotonic() + back
+                        why = f"provider cooldown {int(cooldown)}s" if cooldown > min(60 * n, 600) else "transient infra failure"
+                        print(f"  ↻ retry     {iid}  ({why}, attempt {n}, backoff {back}s)", flush=True)
+                    else:
+                        item["status"] = "escalated"; pending[iid] = {"status": "escalated"}
+                        escalate(item, run_id, ["repeated transient infra failure (model overloaded / no envelope)"])
+                        nt.escalation(project=item.get("repo", "—"), item_id=iid, kind=item["kind"],
+                                      note=item.get("note", ""), run_id=run_id, blocking=["repeated infra failure"])
+                        print(f"  ⚑ escalated {iid}  (infra x{n} — needs a look)", flush=True)
+                elif accepted and not merged:                # lost the merge race on a moving base (I11)
+                    conflicts += 1                           # decomposition-gate feedback signal
+                    n = merge_retries.get(iid, 0) + 1; merge_retries[iid] = n
+                    if n <= max_merge_retries:
+                        item["status"] = "ready"; pending[iid] = {"status": "ready"}   # rebuild on the new base
+                        print(f"  ↻ re-queue  {iid}  (merge race, attempt {n}/{max_merge_retries})", flush=True)
+                    else:
+                        item["status"] = "escalated"; pending[iid] = {"status": "escalated"}
+                        escalate(item, run_id, ["repeated merge conflict — could not land on a moving base (I11)"])
+                        nt.escalation(project=item.get("repo", "—"), item_id=iid, kind=item["kind"],
+                                      note=item.get("note", ""), run_id=run_id,
+                                      blocking=["repeated merge conflict (I11)"])
+                        print(f"  ⚑ escalated {iid}  (merge race x{n})", flush=True)
+                else:                                        # genuine escalation — park, notify, keep going
+                    item["status"] = "escalated"; pending[iid] = {"status": "escalated"}
+                    escalate(item, run_id, blocking, human_brief=brief)
                     nt.escalation(project=item.get("repo", "—"), item_id=iid, kind=item["kind"],
-                                  note=item.get("note", ""), run_id=run_id, blocking=["repeated infra failure"])
-                    print(f"  ⚑ escalated {iid}  (infra x{n} — needs a look)", flush=True)
-            elif accepted and not merged:                # lost the merge race on a moving base (I11)
-                conflicts += 1                           # decomposition-gate feedback signal
-                n = merge_retries.get(iid, 0) + 1; merge_retries[iid] = n
-                if n <= max_merge_retries:
-                    item["status"] = "ready"             # rebuild on the new base — NOT a human escalation
-                    print(f"  ↻ re-queue  {iid}  (merge race, attempt {n}/{max_merge_retries})", flush=True)
-                else:
-                    item["status"] = "escalated"
-                    escalate(item, run_id, ["repeated merge conflict — could not land on a moving base (I11)"])
-                    nt.escalation(project=item.get("repo", "—"), item_id=iid, kind=item["kind"],
-                                  note=item.get("note", ""), run_id=run_id,
-                                  blocking=["repeated merge conflict (I11)"])
-                    print(f"  ⚑ escalated {iid}  (merge race x{n})", flush=True)
-            else:                                        # genuine escalation — park, notify, keep going
-                item["status"] = "escalated"
-                escalate(item, run_id, blocking, human_brief=brief)
-                nt.escalation(project=item.get("repo", "—"), item_id=iid, kind=item["kind"],
-                              note=item.get("note", ""), run_id=run_id, blocking=blocking)
-                print(f"  ⚑ escalated {iid}{price}  → awaiting your ruling (factory keeps running)", flush=True)
-        # --- allocate + dispatch (Rev4 §9): WIP limit + decomposition gate ----
-        # Only co-schedule streams whose artifact bindings are DISJOINT from everything already in
-        # flight (and from each other this cycle). Overlapping work is serialized — it waits for the
-        # conflicting run to finish — instead of racing to a merge conflict. This is what makes it
-        # the designed `allocate` step rather than a naive parallel loop.
-        held = [b for (_p, b) in inflight.values()]    # bindings currently in flight
-        dispatchable = [i for i in ready(items) if i["id"] not in inflight
-                        and retry_after.get(i["id"], 0) <= time.monotonic()]
-        # Nothing is dispatched while the judge family is down — a build that cannot be reviewed is
-        # spend with no possible outcome. Checked only when there is actually something to dispatch.
-        for item in (dispatchable if (dispatchable and len(inflight) < max_parallel
-                                      and judge.ready()) else []):
-            if len(inflight) >= max_parallel:
-                break
-            if item["id"] in inflight:
-                continue
-            if retry_after.get(item["id"], 0) > time.monotonic():
-                continue                               # backing off a transient failure — not yet due
-            b = _bindings(item)
-            if any(_overlaps(b, h) for h in held):
-                print(f"  ⋯ hold      {item['id']}  (bindings {sorted(b)} overlap in-flight — serialized)", flush=True)
-                continue                               # decomposition gate: serialize, don't collide
-            item["status"] = "in_progress"
-            claim = claim_migration_number(item, migration_claims.values())
-            migration_claims[item["id"]] = claim
-            # children stay in the daemon's cgroup, so systemd stop/restart reaps them (no orphans)
-            proc = subprocess.Popen(_cmd(item), cwd=str(FACTORY_ROOT),
-                                    env={**os.environ, "FACTORY_MIGRATION_CLAIM": claim})
-            inflight[item["id"]] = (proc, b)
-            held.append(b)
-            print(f"  ▶ dispatch  {item['id']}  ({item['kind']}) bindings={sorted(b)} "
-                  f"[{len(inflight)}/{max_parallel} in flight, {conflicts} merge-conflicts so far]", flush=True)
-        save(data)
+                                  note=item.get("note", ""), run_id=run_id, blocking=blocking)
+                    print(f"  ⚑ escalated {iid}{price}  → awaiting your ruling (factory keeps running)", flush=True)
+            # --- allocate + dispatch (Rev4 §9): WIP limit + decomposition gate ----
+            # Only co-schedule streams whose artifact bindings are DISJOINT from everything already in
+            # flight (and from each other this cycle). Overlapping work is serialized — it waits for the
+            # conflicting run to finish — instead of racing to a merge conflict. This is what makes it
+            # the designed `allocate` step rather than a naive parallel loop.
+            held = [b for (_p, b) in inflight.values()]    # bindings currently in flight
+            dispatchable = [i for i in ready(items) if i["id"] not in inflight
+                            and retry_after.get(i["id"], 0) <= time.monotonic()]
+            # Nothing is dispatched while the judge family is down — a build that cannot be reviewed is
+            # spend with no possible outcome. Checked only when there is actually something to dispatch.
+            for item in (dispatchable if (dispatchable and len(inflight) < max_parallel
+                                          and judge.ready()) else []):
+                if len(inflight) >= max_parallel:
+                    break
+                if item["id"] in inflight:
+                    continue
+                if retry_after.get(item["id"], 0) > time.monotonic():
+                    continue                               # backing off a transient failure — not yet due
+                b = _bindings(item)
+                if any(_overlaps(b, h) for h in held):
+                    print(f"  ⋯ hold      {item['id']}  (bindings {sorted(b)} overlap in-flight — serialized)", flush=True)
+                    continue                               # decomposition gate: serialize, don't collide
+                item["status"] = "in_progress"; pending[item["id"]] = {"status": "in_progress"}
+                claim = claim_migration_number(item, migration_claims.values())
+                migration_claims[item["id"]] = claim
+                # children stay in the daemon's cgroup, so systemd stop/restart reaps them (no orphans)
+                proc = subprocess.Popen(_cmd(item), cwd=str(FACTORY_ROOT),
+                                        env={**os.environ, "FACTORY_MIGRATION_CLAIM": claim})
+                inflight[item["id"]] = (proc, b)
+                held.append(b)
+                print(f"  ▶ dispatch  {item['id']}  ({item['kind']}) bindings={sorted(b)} "
+                      f"[{len(inflight)}/{max_parallel} in flight, {conflicts} merge-conflicts so far]", flush=True)
+            # Deltas only. A whole-file write here would erase any ruling approved in the observatory
+            # during this cycle — which is exactly what it did before 2026-08-21.
+            save_fields(pending)
+        except Exception as ex:
+            cycle_failures += 1
+            print(f"  ✗ cycle failed ({type(ex).__name__}: {str(ex)[:120]}) "
+                  f"[{cycle_failures}/{MAX_CYCLE_FAILURES}] — retrying", flush=True)
+            if cycle_failures >= MAX_CYCLE_FAILURES:
+                print("  ⚑ daemon stopping: the loop cannot complete a cycle", flush=True)
+                raise
+        else:
+            cycle_failures = 0
         time.sleep(poll_s)
 
 
