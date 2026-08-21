@@ -55,6 +55,21 @@ def table_name(entity: str) -> str:
     return s.lower()
 
 
+_DERIVED_MARKERS = (
+    "not a table", "derived interface", "not a stored core entity",
+    "seams only", "not built", "derived, not authored",
+)
+
+
+def _declared_derived(resolver, entity: str) -> bool:
+    """Does canon itself say this entity has no table?"""
+    try:
+        block = (resolver.entity(entity) or "").lower()
+    except Exception:
+        return False
+    return any(m in block for m in _DERIVED_MARKERS)
+
+
 def _migration_text(repo: Path) -> str:
     d = repo / "supabase" / "migrations"
     if not d.is_dir():
@@ -101,8 +116,16 @@ def check(repo: Path, journey: str) -> ReadinessReport:
         entities = canon.CanonResolver(repo).bindings(journey) or set()
     except Exception:
         entities = set()
+    resolver = canon.CanonResolver(repo)
     for e in sorted(entities):
         if e in ("*",):
+            continue
+        # Canon may declare an entity DERIVED — computed on demand, recorded in the event spine,
+        # deliberately without a table (DEC-014/066: Recommendation). Believe canon rather than
+        # assuming every ontology entity is storage, or the check invents work that canon has
+        # already ruled out.
+        if _declared_derived(resolver, e):
+            rep.notes.append(f"{e}: canon declares it derived — no table expected")
             continue
         # An ontology entity may land under a prefixed table (User -> app_user). Accept any of the
         # names the schema plausibly uses; only flag an entity that exists under none of them.

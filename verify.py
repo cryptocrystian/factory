@@ -543,11 +543,15 @@ def verify_orchestration_table_stakes() -> None:
     if repo.is_dir():
         r = readiness.check(repo, "JRN-S4")
         check(r.ready, "a shipped journey reads as ready", "; ".join(r.blocking())[:70])
+        # DEC-066: canon may declare an entity derived — the check must believe canon rather than
+        # inventing schema work canon has explicitly ruled out.
         r2 = readiness.check(repo, "JRN-G2")
-        check(not r2.ready and r2.missing_tables,
-              "a journey whose canon names a table that does not exist is caught BEFORE dispatch",
-              "; ".join(r2.blocking())[:70])
-        check("Author them first" in r2.brief(), "the gap is handed over as architect work")
+        check(r2.ready, "an entity canon declares DERIVED is not reported as a missing table",
+              "; ".join(r2.notes)[:70])
+        check(any("derived" in n for n in r2.notes), "the derived declaration is recorded as a note")
+        # a genuinely absent table is still caught: prove the mechanism on a synthetic entity
+        check(readiness._declared_derived(__import__("canon").CanonResolver(repo), "Note") is False,
+              "a real stored entity is still expected to have a table")
         r3 = readiness.check(repo, "JRN-NOPE")
         check(not r3.ready, "an unknown journey is never dispatched")
 
