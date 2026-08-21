@@ -568,6 +568,46 @@ def verify_orchestration_table_stakes() -> None:
           "ahead and behind are both refused, for different reasons")
 
 
+def verify_rollback_safety() -> None:
+    """A rollback must never be worse than the breach it undoes. `git status --porcelain` reports an
+    untracked DIRECTORY as one entry ("?? app/"), and unlink() on a directory raised
+    IsADirectoryError — which crashed the whole lane and escalated JRN-X1 on 2026-08-21 for what was
+    an ordinary out-of-grant write."""
+    import subprocess, tempfile
+    sys.path.insert(0, str(ROOT / "control-plane"))
+    import permissions as perm  # noqa: E402
+
+    ws = Path(tempfile.mkdtemp())
+    subprocess.run(["git", "init", "-q"], cwd=ws)
+    subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "init"], cwd=ws,
+                   capture_output=True)
+    (ws / "app" / "deals").mkdir(parents=True)
+    (ws / "app" / "deals" / "page.tsx").write_text("x")
+    (ws / "tests").mkdir()
+    (ws / "tests" / "ok.spec.ts").write_text("y")
+
+    class T:
+        def __init__(self): self.events = []
+        def log(self, **kw): self.events.append(kw)
+
+    class Run:
+        workspace = ws
+        tracer = T()
+        def git(self, *a):
+            return subprocess.run(["git", *a], cwd=str(ws), capture_output=True, text=True).stdout
+
+    try:
+        r = perm.enforce(Run(), "test-author")
+    except Exception as ex:
+        check(False, "an out-of-grant DIRECTORY does not crash the lane", f"{type(ex).__name__}: {ex}")
+        return
+    check(True, "an out-of-grant directory does not crash the lane")
+    check(not r.ok and r.breaches, "the breach is still detected")
+    check(not (ws / "app" / "deals").exists(), "the out-of-grant directory is rolled back")
+    check((ws / "tests" / "ok.spec.ts").exists(), "granted paths survive the rollback")
+    check(hasattr(r, "rollback_errors"), "a failed rollback is reported rather than raised")
+
+
 def verify_selftest() -> None:
     rc, out = run(["uv", "run", str(ROOT / "control-plane" / "selftest_k1.py")])
     check(rc == 0 and "ALL PASS" in out, "K1 adapter-spine self-test",
@@ -604,6 +644,7 @@ def main(argv: list[str]) -> int:
     verify_phase_intent()
     verify_loop_governance()
     verify_escalation_payload()
+    verify_rollback_safety()
     verify_shipping_and_concurrency()
     verify_orchestration_table_stakes()
     verify_replay(repo)

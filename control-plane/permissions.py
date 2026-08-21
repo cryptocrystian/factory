@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -19,6 +20,7 @@ import config
 class PermissionResult:
     ok: bool
     breaches: list[str] = field(default_factory=list)
+    rollback_errors: list[str] = field(default_factory=list)   # a rollback that itself failed
     rolled_back: list[str] = field(default_factory=list)
 
 
@@ -71,14 +73,25 @@ def enforce(run, role: str) -> PermissionResult:
         res.breaches.append(f"{status.strip()} {path}")
         # roll back: revert tracked modifications/deletions; remove untracked additions
         if "?" in status:
-            p = run.workspace / path
-            if p.exists():
-                p.unlink()
+            # `git status --porcelain` reports an untracked DIRECTORY as one entry ("?? app/deals/"),
+            # not as its files. unlink() on a directory raises IsADirectoryError, which crashed the
+            # whole lane on 2026-08-21 and escalated JRN-X1 for what was an ordinary rollback.
+            # A rollback failing must never be worse than the breach it is undoing.
+            target = run.workspace / path.rstrip("/")
+            try:
+                if target.is_symlink() or target.is_file():
+                    target.unlink()
+                elif target.is_dir():
+                    shutil.rmtree(target)
+            except OSError as ex:
+                run.tracer.log(event_detail="rollback_failed", role=role, path=path, error=str(ex))
+                res.rollback_errors.append(f"{path}: {ex}")
         else:
             try:
                 run.git("checkout", "HEAD", "--", path)
-            except Exception:
-                pass
+            except Exception as ex:
+                run.tracer.log(event_detail="rollback_failed", role=role, path=path, error=str(ex))
+                res.rollback_errors.append(f"{path}: {ex}")
         res.rolled_back.append(path)
     if not res.ok:
         run.tracer.log(event_detail="permission_breach", role=role,
