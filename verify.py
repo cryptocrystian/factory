@@ -436,6 +436,17 @@ def verify_loop_governance() -> None:
     r3 = R(); r3._started_at = _time.monotonic() - (feat.MAX_RUN_WALL_S + 60)
     check(lane._budget_spent(r3), "a run past its wall clock stops")
 
+    # 4b. a breach names the boundary AND who owns the path, for every role
+    check("ARCHITECT owns migrations" in feat._grant_owner(["?? supabase/migrations/0016_x.sql"]),
+          "a builder reaching for a migration is told the architect owns it")
+    check("TEST-AUTHOR" in feat._grant_owner(["M tests/unit/x.spec.ts"]),
+          "a role reaching for tests is told it cannot edit what judges it")
+    check("canon" in feat._grant_owner(["M canon/Decision Log.md"]).lower(),
+          "a role reaching for canon is routed to the architect/PM")
+    lane_src = (ROOT / "lanes" / "feature.py").read_text()
+    check("builder_breach_corrected" in lane_src,
+          "a builder breach costs an iteration, not the run")
+
     # 5. the migration claim reaches the architect's prompt
     _os.environ["FACTORY_MIGRATION_CLAIM"] = "0042"
     note = feat._migration_claim_note()

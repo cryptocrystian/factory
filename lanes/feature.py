@@ -61,6 +61,22 @@ def _migration_claim_note() -> str:
             f"and holds the adjacent numbers. Never take 'the next number' by listing the directory. ")
 
 
+def _grant_owner(paths) -> str:
+    """Who may write the path a role just reached for. A breach is only recoverable if the agent is
+    told where the work belongs, not merely that it was refused."""
+    text = " ".join(str(p) for p in paths).lower()
+    if "supabase/migrations" in text or ".sql" in text:
+        return ("the ARCHITECT owns migrations — describe the schema change you need in your report "
+                "and it will be authored for you; do not write one yourself")
+    if "canon/" in text:
+        return ("canon is the ARCHITECT's and the PRODUCT MANAGER's — state the decision you need, "
+                "do not edit canon")
+    if "tests/" in text:
+        return ("the TEST-AUTHOR owns tests — you may not edit what judges your work; say what "
+                "coverage is missing instead")
+    return "another role owns that path — state what you need in your report instead of writing it"
+
+
 def _fingerprint(findings) -> str:
     """What the reviewer is blocking on, normalised — for detecting a loop that is not moving."""
     return "|".join(sorted(str(f).strip().lower()[:120] for f in (findings or [])))
@@ -477,6 +493,15 @@ class Lane:
                                      "gen:tokens/check:tokens/typecheck." + self._design_selfcheck()
                                      + " Return your envelope."),
                              cwd=run.workspace, add_dirs=[run.dir], gate_fns=[gates.diff_matches_claims])
+            breach, self._last_breach = self._last_breach, []
+            if fix is None and breach:
+                # It reached outside its grant and the write was rolled back. Name the boundary and
+                # who owns it, then spend the next iteration properly — JRN-B1's builder tried to
+                # author `0016_scored_input_write_boundary.sql` and simply failed, repeatedly.
+                run.tracer.log(event_detail="builder_breach_corrected", i=i, breach=breach)
+                findings = [f"Your write to {', '.join(breach)} was ROLLED BACK — it is outside your "
+                            f"grant. {_grant_owner(breach)}.", *findings]
+                continue
             l0 = True
             for g in self._l0_gates():
                 rep = g(None, run); run.tracer.gate(rep); l0 = l0 and rep.passed
@@ -537,9 +562,11 @@ class Lane:
                     run.tracer.log(event_detail="architect_breach_corrected", round=i, breach=breach)
                     findings = [
                         f"Your write to {', '.join(breach)} was ROLLED BACK: it is outside your grant. "
-                        f"You may write ONLY {grants}. Verification scripts, tests and app source belong "
-                        "to other roles — you cannot edit what judges your work. Resolve the findings "
-                        "below by authoring a migration or a canonical decision instead.",
+                        f"You may write ONLY {grants}. Verification scripts, package manifests, tests "
+                        "and app source belong to other roles — you cannot edit what judges your work. "
+                        "If your migration needs a proof script or a seed embedded, ASK FOR IT in your "
+                        "remediation_brief and the builder will write it. Resolve the findings below by "
+                        "authoring a migration or a canonical decision, nothing else.",
                         *findings,
                     ]
                     continue
