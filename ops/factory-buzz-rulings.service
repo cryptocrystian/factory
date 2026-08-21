@@ -1,0 +1,19 @@
+[Unit]
+Description=Factory Buzz rulings — ingest owner decisions typed in Buzz and apply them to the backlog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/factory
+Environment=HOME=/root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin
+# The return half of the decision plane: escalations post to Buzz, rulings come back the same way,
+# and nobody has to relay a decision into YAML by hand.
+ExecStart=/root/.local/bin/uv run control-plane/buzz_rulings.py --poll 60 --since-hours 48
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

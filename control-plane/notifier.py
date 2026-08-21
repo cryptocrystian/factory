@@ -38,7 +38,8 @@ class Notifier:
     (or None). Callers never depend on the return value or on success."""
     enabled = False
 
-    def escalation(self, *, project, item_id, kind, note, run_id, blocking, url=None):
+    def escalation(self, *, project, item_id, kind, note, run_id, blocking, url=None,
+                   human_brief=None):
         return None
 
     def accepted(self, *, project, item_id, kind, note, run_id):
@@ -85,9 +86,25 @@ class BuzzNotifier(Notifier):
             print(f"  (notifier: post to {project} failed: {e})", file=sys.stderr)
             return None
 
-    def escalation(self, *, project, item_id, kind, note, run_id, blocking, url=None):
+    def escalation(self, *, project, item_id, kind, note, run_id, blocking, url=None,
+                   human_brief=None):
         if not self.events.get("escalated", True):
             return None
+        hb = human_brief or {}
+        if hb.get("question"):
+            lines = [f"⚑ DECISION — {item_id}", f"project: {project} · kind: {kind}", "",
+                     f"Q: {hb['question']}"]
+            if hb.get("why"):
+                lines += ["", f"Why: {hb['why']}"]
+            for i, opt in enumerate(hb.get("options") or [], 1):
+                lines.append(f"  {i}. {opt}")
+            if hb.get("recommendation"):
+                lines += ["", f"Recommendation: {hb['recommendation']}"]
+            lines += ["", f"Run: {run_id}", f"Observatory: {url or OBSERVE_URL}", "",
+                      "To rule it, reply in this channel:",
+                      f"    RULE {item_id}: approve <your ruling>",
+                      f"    RULE {item_id}: reject <why>"]
+            return self.post(project, "\n".join(lines), facet="product")
         lines = [f"⚑ ESCALATION — {item_id}",
                  f"project: {project} · kind: {kind}"]
         if note:
@@ -99,7 +116,14 @@ class BuzzNotifier(Notifier):
         lines += ["",
                   "Your ruling is needed (usually a DEC in canon, then set the item ready and re-run).",
                   f"Run: {run_id}",
-                  f"Observatory: {url or OBSERVE_URL}"]
+                  f"Observatory: {url or OBSERVE_URL}",
+                  "",
+                  # The reply syntax IS the workflow: a ruling typed here is ingested by
+                  # buzz_rulings.py and applied to the backlog, so the decision plane is Buzz and
+                  # nobody has to be the go-between.
+                  f"To rule it, reply in this channel:",
+                  f"    RULE {item_id}: approve <your ruling>",
+                  f"    RULE {item_id}: reject <why>"]
         return self.post(project, "\n".join(lines), facet="product")
 
     def accepted(self, *, project, item_id, kind, note, run_id):

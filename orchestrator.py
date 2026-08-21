@@ -513,7 +513,7 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
                 else:                                        # genuine escalation — park, notify, keep going
                     item["status"] = "escalated"; pending[iid] = {"status": "escalated"}
                     escalate(item, run_id, blocking, human_brief=brief)
-                    nt.escalation(project=item.get("repo", "—"), item_id=iid, kind=item["kind"],
+                    nt.escalation(human_brief=brief, project=item.get("repo", "—"), item_id=iid, kind=item["kind"],
                                   note=item.get("note", ""), run_id=run_id, blocking=blocking)
                     print(f"  ⚑ escalated {iid}{price}  → awaiting your ruling (factory keeps running)", flush=True)
             # --- allocate + dispatch (Rev4 §9): WIP limit + decomposition gate ----
