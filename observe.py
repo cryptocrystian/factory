@@ -85,6 +85,37 @@ def parse_stream(path: Path) -> dict:
             "tools": sum(1 for a in activity if a["kind"] == "tool")}
 
 
+def role_config(role: str) -> dict:
+    """The agent's core four — context, model, prompt, tools — plus its write boundary.
+
+    SSSF's observability shows this per phase because it is what you tune: if you cannot see which
+    model, which thinking level, which tools and which system prompt produced a result, you cannot
+    improve it. Ours showed the user prompt and nothing else."""
+    try:
+        import config as _cfg
+        r = _cfg.role(role)
+    except Exception:
+        return {}
+    sysmd = _cfg.AGENTS_DIR / r.system_md
+    out = {
+        "model": r.model,
+        "chain": list(_cfg.model_chain(role)),
+        "family": r.family,
+        "thinking": r.thinking,
+        "tools": list(r.tools),
+        "timeout_s": r.timeout_s,
+        "output_type": r.output_type,
+        "writes": _cfg.WRITE_GRANTS.get(role),
+        "intent": _cfg.phase_intent(role),
+        "system_prompt_path": str(sysmd),
+    }
+    try:
+        out["system_prompt"] = sysmd.read_text()[:20000]
+    except OSError:
+        out["system_prompt"] = ""
+    return out
+
+
 def phase_stream(run_id: str, role: str, seq: int) -> dict | None:
     rd = RUNS_DIR / run_id
     sess = rd / "sessions" / role
@@ -93,6 +124,8 @@ def phase_stream(run_id: str, role: str, seq: int) -> dict | None:
     if not path:
         return None
     out = parse_stream(path)
+    out["config"] = role_config(role)
+    out["route"] = path.name          # which model actually served it (fallback streams are suffixed)
     # attach the brief the agent worked from, if present
     for name in ("context.md", "plan.md"):
         p = rd / name
@@ -229,6 +262,9 @@ class Handler(BaseHTTPRequestHandler):
                 data = load_decisions()
                 pending = [d for d in data["decisions"] if d.get("status") == "pending"]
                 return self._json({"decisions": data["decisions"], "pending": len(pending)})
+            if path == "/api/roles":
+                import config as _cfg
+                return self._json({"roles": {n: role_config(n) for n in _cfg.ROLES}})
             if path.startswith("/api/runs/") and path.endswith("/phase"):
                 rid = path[len("/api/runs/"):-len("/phase")]
                 q = parse_qs(urlparse(self.path).query)
@@ -411,6 +447,26 @@ display:flex;align-items:center;gap:10px;margin:6px 0 2px}
 .dbtn{font-family:var(--mono);font-size:12px;padding:7px 14px;border-radius:4px;border:1px solid var(--brd);cursor:pointer;background:var(--surf);color:var(--txt)}
 .dbtn.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
 .dstatus{font-family:var(--mono);font-size:11px;color:var(--good);margin-left:auto}
+.lanes{margin:14px 0}
+.axis{display:flex;justify-content:space-between;font-size:11px;color:var(--dim);padding:0 0 4px 132px}
+.lane-row{display:flex;align-items:center;gap:8px;margin:3px 0}
+.lane-name{width:124px;flex:none;font-size:12px;color:var(--dim);text-align:right;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lane-track{position:relative;flex:1;height:26px;background:var(--panel);border-radius:5px;
+  border:1px solid var(--brd)}
+.blk{position:absolute;top:3px;height:20px;border-radius:4px;cursor:pointer;overflow:hidden;
+  display:flex;align-items:center;padding:0 6px;min-width:14px;transition:filter .12s}
+.blk:hover{filter:brightness(1.25)}
+.blk-l{font-size:10px;color:#08110c;font-weight:600;white-space:nowrap;text-overflow:ellipsis;overflow:hidden}
+.blk.ok{background:var(--ok)}
+.blk.bad{background:var(--bad)}
+.blk.run{background:var(--dim)}
+.cfg{margin:10px 0;padding:10px 12px;background:var(--panel);border:1px solid var(--brd);border-radius:6px}
+.cfg h4{margin:0 0 6px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--dim)}
+.cfg .row{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12px}
+.cfg .row b{color:var(--fg)}
+.cfg pre{margin:8px 0 0;max-height:220px;overflow:auto;font-size:11px;line-height:1.45;
+  background:var(--bg);padding:8px;border-radius:4px;border:1px solid var(--brd);white-space:pre-wrap}
 </style></head><body>
 <header>
   <span class="brand">Factory · Observatory</span>
@@ -479,7 +535,7 @@ function marker(m){
   else {const s=JSON.stringify(data);if(s!=="{}")d.append(el("div","ev",s.slice(0,400)));}
   return d;
 }
-let view="flow";
+let view="lanes";
 function renderTimeline(tlData){
   const tl=el("div","tl");
   (tlData||[]).forEach(t=>{
@@ -538,6 +594,48 @@ function renderFlow(tlData){
   if(!wrap.children.length)wrap.append(el("div","empty","No phases recorded for this run."));
   return wrap;
 }
+function renderLanes(tlData){
+  // SSSF's signature view: one lane per agent, phases placed on a shared time axis, so a run reads
+  // as WHO did WHAT and FOR HOW LONG rather than as a flat list. Code phases get their own lane —
+  // the agents-plus-code split is the thing worth seeing at a glance.
+  const ph=tlData.filter(x=>x.type==="phase"&&x.ts);
+  if(!ph.length)return el("div","empty","No phases recorded for this run.");
+  const t0=Math.min(...ph.map(p=>p.ts));
+  const t1=Math.max(...ph.map(p=>p.ts_end||p.ts+1));
+  const span=Math.max(1,t1-t0);
+  const lanes=[];const byLane={};
+  ph.forEach(p=>{
+    const key=(p.kind==="code")?"· code":(p.owner||p.name);
+    if(!byLane[key]){byLane[key]=[];lanes.push(key)}
+    byLane[key].push(p);
+  });
+  const wrap=el("div","lanes");
+  const axis=el("div","axis");
+  axis.append(el("span",null,"0m"), el("span",null,Math.round(span/60)+"m"));
+  wrap.append(axis);
+  lanes.forEach(k=>{
+    const lane=el("div","lane-row");
+    lane.append(el("div","lane-name",k));
+    const track=el("div","lane-track");
+    byLane[k].forEach(p=>{
+      const a=((p.ts-t0)/span)*100, w=Math.max(1.2,(((p.ts_end||p.ts+1)-p.ts)/span)*100);
+      const cost=(p.items||[]).reduce((n,i)=>n+(i.cost||0),0);
+      const b=el("div","blk "+(p.status==="success"?"ok":p.status==="fail"?"bad":"run"));
+      b.style.left=a+"%";b.style.width=w+"%";
+      const mins=Math.round(((p.ts_end||p.ts)-p.ts)/60);
+      b.title=p.name+" · "+(p.status||"running")+" · "+mins+"m"+(cost?" · $"+cost.toFixed(2):"");
+      b.append(el("span","blk-l",p.name));
+      b.onclick=()=>openPhase(p);
+      track.append(b);
+    });
+    lane.append(track);wrap.append(lane);
+  });
+  return wrap;
+}
+function openPhase(p){
+  if(p.kind==="code"){return}
+  showPhase(p.owner||p.name,p.seq||0);
+}
 function loadDetail(id){
   curRunId=id;
   fetch("/api/runs/"+id).then(r=>r.json()).then(run=>{
@@ -551,9 +649,11 @@ function loadDetail(id){
     head.append(kv);d.append(head);
     if(run.reason)d.append(el("div","reason",run.reason));
     const tabs=el("div","viewtabs");
-    ["flow","timeline"].forEach(v=>{const b=el("button",view===v?"on":null,v);b.onclick=()=>{view=v;loadDetail(id)};tabs.append(b)});
+    ["lanes","flow","timeline"].forEach(v=>{const b=el("button",view===v?"on":null,v);b.onclick=()=>{view=v;loadDetail(id)};tabs.append(b)});
     d.append(tabs);
-    d.append(view==="flow"?renderFlow(run.timeline):renderTimeline(run.timeline));
+    d.append(view==="lanes"?renderLanes(run.timeline)
+            :view==="flow"?renderFlow(run.timeline)
+            :renderTimeline(run.timeline));
   });
 }
 let curRunId=null, mode="runs", pending=0;
@@ -568,7 +668,34 @@ function openDrill(role,seq,label){
               el("span","fns","· "+(st.tools||0)+" tool calls · $"+(st.cost||0).toFixed(2)));
     const x=el("button","x","×");x.onclick=()=>wrap.remove();dh.append(x);
     inner.append(dh);
-    if(st.prompt){const pr=el("div","env");pr.append(el("span","lbl","prompt given"));pr.append(document.createTextNode(st.prompt));pr.style.borderColor="var(--brd)";inner.append(pr)}
+    // The core four — context, model, prompt, tools — plus the write boundary. Without these you
+    // can see WHAT an agent did but not WHAT IT WAS, which is the half you actually tune.
+    const c=st.config||{};
+    if(c.model){
+      const cfg=el("div","cfg");cfg.append(el("h4",null,"agent config"));
+      const row=el("div","row");
+      const chain=(c.chain||[]).join("  →  ")||c.model;
+      row.innerHTML="<span>model <b>"+chain+"</b></span>"+
+        "<span>thinking <b>"+(c.thinking||"—")+"</b></span>"+
+        "<span>family <b>"+(c.family||"—")+"</b></span>"+
+        "<span>timeout <b>"+(c.timeout_s||"—")+"s</b></span>"+
+        "<span>output <b>"+(c.output_type||"—")+"</b></span>"+
+        "<span>served by <b>"+(st.route||"—")+"</b></span>";
+      cfg.append(row);
+      const row2=el("div","row");
+      row2.innerHTML="<span>tools <b>"+((c.tools||[]).join(", ")||"none")+"</b></span>";
+      cfg.append(row2);
+      const w=(c.writes===null||c.writes===undefined)?"unrestricted":((c.writes||[]).join(", ")||"read-only");
+      const row3=el("div","row");row3.innerHTML="<span>writes <b>"+w+"</b></span>";cfg.append(row3);
+      if(c.intent)cfg.append(el("div","row",c.intent));
+      if(c.system_prompt){
+        const det=document.createElement("details");
+        const sum=document.createElement("summary");sum.textContent="system prompt";
+        det.append(sum);const pre=el("pre",null,c.system_prompt);det.append(pre);cfg.append(det);
+      }
+      inner.append(cfg);
+    }
+    if(st.prompt){const pr=el("div","env");pr.append(el("span","lbl","user prompt (compiled)"));pr.append(document.createTextNode(st.prompt));pr.style.borderColor="var(--brd)";inner.append(pr)}
     (st.activity||[]).forEach(a=>{
       const row=el("div","act "+a.kind+(a.error?" err":""));
       if(a.kind==="tool"){row.append(el("span","tag",a.name||"tool"));
