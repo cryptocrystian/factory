@@ -248,7 +248,7 @@ def _verdict(target):
     import json
     run = _latest_run(target)
     if not run:
-        return False, False, None, ["run produced no verdict"], False, 0.0, None
+        return False, False, None, ["run produced no verdict"], False, 0.0, None, {}
     run_id = run["run_id"]
     conn = obsdb.connect()
     try:
@@ -258,11 +258,16 @@ def _verdict(target):
     accepted = merged = transient = False
     cooldown = 0.0
     cost = None
+    brief = {}
     for e in (r["events"] if r else []):
         d = json.loads(e["detail"]) if e.get("detail") else {}
         ed = d.get("event_detail")
         if ed == "finish":
             accepted = bool(d.get("accepted")); merged = bool(d.get("merged"))
+        elif ed in ("architect_not_resolved", "architect_surfaced_decision", "pm_escalated"):
+            hb = d.get("human_brief") or ({"question": d.get("question")} if d.get("question") else {})
+            if hb.get("question"):
+                brief = hb                      # the last one wins: the PM's phrasing supersedes
         elif ed == "run_cost":
             cost = d.get("paid_usd")
         elif ed == "agent_no_envelope":
@@ -272,7 +277,7 @@ def _verdict(target):
             transient = True                       # the lane stopped itself: undecidable, not a ruling
             cooldown = max(cooldown, float(d.get("retry_after_s") or 0.0))
     blocking = [] if accepted else _blocking(run_id)
-    return accepted, merged, run_id, blocking, transient, cooldown, cost
+    return accepted, merged, run_id, blocking, transient, cooldown, cost, brief
 
 
 def _target_of(item):
@@ -392,7 +397,7 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
             item = by_id.get(iid)
             if not item:
                 continue
-            accepted, merged, run_id, blocking, transient, cooldown, cost = _verdict(_target_of(item))
+            accepted, merged, run_id, blocking, transient, cooldown, cost, brief = _verdict(_target_of(item))
             item["paid_usd"] = cost
             price = "" if cost is None else f"  (${cost:.2f} paid)"
             item["run_id"] = run_id
@@ -434,7 +439,7 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
                     print(f"  ⚑ escalated {iid}  (merge race x{n})", flush=True)
             else:                                        # genuine escalation — park, notify, keep going
                 item["status"] = "escalated"
-                escalate(item, run_id, blocking)
+                escalate(item, run_id, blocking, human_brief=brief)
                 nt.escalation(project=item.get("repo", "—"), item_id=iid, kind=item["kind"],
                               note=item.get("note", ""), run_id=run_id, blocking=blocking)
                 print(f"  ⚑ escalated {iid}{price}  → awaiting your ruling (factory keeps running)", flush=True)

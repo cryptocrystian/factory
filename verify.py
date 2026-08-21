@@ -464,6 +464,23 @@ def verify_loop_governance() -> None:
     check(int(second) == int(first) + 1, "claims are sequential")
 
 
+def verify_escalation_payload() -> None:
+    """What the owner reads. JRN-B1's PM packaged a business question — vendor activation and SBA
+    financing parameters — and the queue showed a service_role RLS finding instead, because
+    escalate() never carried the brief out of the trace."""
+    src = (ROOT / "orchestrator.py").read_text()
+    check("human_brief=brief" in src, "the escalation carries the PM's question, not just findings")
+    check('"pm_escalated"' in src, "a PM escalation is recognised as the owner-facing brief")
+    import importlib.util as _il
+    spec = _il.spec_from_file_location("orch_e", ROOT / "orchestrator.py")
+    orch = _il.module_from_spec(spec); spec.loader.exec_module(orch)
+    import inspect
+    sig = inspect.signature(orch.escalate)
+    check("human_brief" in sig.parameters, "escalate() accepts the brief")
+    sig2 = inspect.signature(orch._queue_decision)
+    check("human_brief" in sig2.parameters, "the queue records the brief")
+
+
 def verify_selftest() -> None:
     rc, out = run(["uv", "run", str(ROOT / "control-plane" / "selftest_k1.py")])
     check(rc == 0 and "ALL PASS" in out, "K1 adapter-spine self-test",
@@ -499,6 +516,7 @@ def main(argv: list[str]) -> int:
     verify_stale_green()
     verify_phase_intent()
     verify_loop_governance()
+    verify_escalation_payload()
     verify_replay(repo)
     if a.with_docker:
         verify_docker(repo)
