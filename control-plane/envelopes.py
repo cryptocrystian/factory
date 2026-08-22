@@ -20,9 +20,21 @@ class EnvelopeBase(BaseModel):
     model_config = {"extra": "allow"}  # roles may add fields; the subclass declares the ones gates read
 
 
+class AcceptanceGate(BaseModel):
+    """One machine-checkable promise, declared BEFORE the build. `check` is a shell command run in
+    the run's workspace; `expect` is a string that must appear in its output. A gate is met only
+    when running it says so — never by assertion (see control-plane/ledger.py)."""
+    model_config = {"populate_by_name": True, "extra": "allow"}
+    id: str = ""
+    description: str = ""
+    check: str = ""
+    expect: str = ""
+
+
 class PlanOutput(EnvelopeBase):
     artifacts: list[str] = Field(default_factory=list)
     commit_message: str = ""
+    gates: list[AcceptanceGate] = Field(default_factory=list)
 
 
 class BuildOutput(EnvelopeBase):

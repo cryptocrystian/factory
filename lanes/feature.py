@@ -85,7 +85,7 @@ def _fingerprint(findings) -> str:
 MAX_FIX_ITERS = 3          # bounded builder fix loop (I9): converge or escalate
 MAX_ARCH_ROUNDS = 4        # bounded architect authority loop: enough rounds to close a lockdown cascade
 
-import config, omp, gates, meter, permissions as perm
+import config, omp, gates, ledger, meter, permissions as perm
 import envelopes as E
 from canon import CanonResolver
 from session import Run
@@ -261,6 +261,12 @@ class Lane:
                            gate_fns=[gates.artifacts_exist])
         if plan is None:
             return run.finish(False, reason="planning failed")
+        # The planner's own acceptance ledger — what IT says would prove the work done, as runnable
+        # checks. Declared before a line is written, so it cannot be softened once the build is hard.
+        self._gates = list(getattr(plan, "gates", []) or [])
+        if self._gates:
+            run.tracer.log(event_detail="ledger_declared", count=len(self._gates),
+                           ids=[getattr(g, "id", "") for g in self._gates])
 
         # -- build (writes source into the repo; L0 gate + bounded fix) --------
         l0_ok = self._build(run, plan)
@@ -268,9 +274,14 @@ class Lane:
         # -- test-author (different family; writes tests only) + unit gate -----
         unit_ok = self._test(run)
 
+        # -- the declared ledger, decided by code, BEFORE the judge is spent ---
+        ledger_findings = self._ledger(run)
+
         # -- review (different family; read-only) + verdict gate ---------------
         approved, findings, review = self._review(run)
-        accepted = l0_ok and unit_ok[0] and approved and self._agent_gates_ok
+        findings = ledger_findings + list(findings)
+        accepted = (l0_ok and unit_ok[0] and approved and self._agent_gates_ok
+                    and not ledger_findings)
         if not accepted:
             # ROUTE BY FINDING CLASS, NOT BY EXHAUSTION. The builder is structurally barred from
             # migrations and canon, so a finding naming one cannot be closed by the fix loop —
@@ -449,6 +460,21 @@ class Lane:
         run.commit(f"test: {self.journey} acceptance tests")
         return rep.passed, rep.evidence
 
+    def _ledger(self, run) -> list[str]:
+        """Run the declared gates and return unmet ones as findings.
+
+        This is deliberately cheap and deliberately early: a criterion a shell command can settle
+        should never consume a review cycle. At 78 judge requests per run against a subscription
+        that hit 100%, the judge is the scarce resource — spend it on what only judgment can decide.
+        It never grants acceptance; the reviewer and the L0 gates remain the authority."""
+        if not getattr(self, "_gates", None):
+            return []
+        rep = ledger.run(self._gates, run.workspace)
+        (run.dir / "GATES.md").write_text(rep.markdown())
+        run.tracer.log(event_detail="ledger_run", met=rep.met, total=rep.total,
+                       unmet=[r.id for r in rep.unmet()])
+        return rep.findings()
+
     def _review(self, run):
         review = self._agent(run, "reviewer", "review",
                            prompt=self._reviewer_prompt(run),
@@ -524,8 +550,12 @@ class Lane:
                 run, prompt=("Reconcile/extend the acceptance tests to the current source and the findings "
                              f"in findings-{i}.md. Run npm run test:unit; leave a real defect failing and "
                              "name it. Tests only. Return your envelope."))
+            ledger_findings = self._ledger(run)
             approved, findings, _ = self._review(run)
-            if l0 and unit_ok and approved and self._agent_gates_ok:
+            findings = ledger_findings + list(findings)
+            # A declared gate still unmet is not an accepted build, whatever the review says: the
+            # planner promised it, and code says it is not there.
+            if l0 and unit_ok and approved and self._agent_gates_ok and not ledger_findings:
                 run.tracer.log(event_detail="converged", iter=i)
                 return True
         run.tracer.log(event_detail="not_converged", iters=MAX_FIX_ITERS)
