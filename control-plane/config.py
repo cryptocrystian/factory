@@ -89,20 +89,36 @@ ROLES: dict[str, Role] = {
 # Ids are overridable per role by env var, because an aggregator's catalog moves faster than this
 # file does.
 _FALLBACK_DEFAULTS: dict[str, tuple[str, ...]] = {
-    "test-author":     ("openrouter/openai/gpt-5.6-sol",   "openrouter/x-ai/grok-4.6"),
-    "reviewer":        ("openrouter/openai/gpt-5.6-terra", "openrouter/x-ai/grok-4.6"),
-    "product-manager": ("openrouter/openai/gpt-5.6-sol",   "openrouter/x-ai/grok-4.6"),
+    # Position 2 is a SECOND FREE FAMILY, not a paid route. Gemini 3.1 Pro on the Antigravity
+    # subscription: frontier tier, 1M context, zero marginal cost, and its own daily+weekly quota
+    # independent of Codex's. The single-judge ceiling — one exhausted subscription halting the
+    # whole factory for six days — is what this removes. Position 3 stays paid and last.
+    #
+    # Antigravity also serves Claude and GPT-OSS. The model id is pinned to Gemini deliberately:
+    # a judge on the builder's family would silently void the cross-family independence (I3) that
+    # makes the review worth anything.
+    "test-author":     ("google-antigravity/gemini-3.1-pro", "openrouter/openai/gpt-5.6-sol"),
+    "reviewer":        ("google-antigravity/gemini-3.1-pro", "openrouter/openai/gpt-5.6-terra"),
+    "product-manager": ("google-antigravity/gemini-3.1-pro", "openrouter/openai/gpt-5.6-sol"),
 }
 
 
-def paid_fallback_enabled() -> bool:
-    """Paid routes are OFF unless the owner switches them on (OMP_ALLOW_PAID_FALLBACK=1).
+# Providers billed by SUBSCRIPTION — free at the margin. A route on one of these is always
+# available; only metered routes are gated behind an explicit opt-in to spend.
+SUBSCRIPTION_PROVIDERS = ("openai-codex/", "anthropic/", "google-antigravity/", "google-gemini-cli/")
 
-    The factory runs on subscriptions, where a run costs nothing at the margin. A fallback bills
-    real money per token, and on 2026-08-19 it did so unattended and unbudgeted while the owner
-    was asleep — which is not a decision software should make for someone. Off by default means an
-    exhausted subscription PAUSES the factory (the preflight already holds dispatch and re-probes
-    every 30 minutes, so it resumes by itself when quota returns) instead of quietly spending."""
+
+def is_paid_route(model: str) -> bool:
+    return not model.startswith(SUBSCRIPTION_PROVIDERS)
+
+
+def paid_fallback_enabled() -> bool:
+    """May the factory spend REAL MONEY unattended? Off unless the owner says otherwise.
+
+    On 2026-08-19 a paid fallback billed an account dry overnight, unbudgeted. Subscriptions are
+    free at the margin, so an exhausted one should PAUSE the factory (the preflight holds dispatch
+    and re-probes every 30 minutes) rather than quietly reach for a card. This gate governs metered
+    routes ONLY — a second free subscription is always allowed, because using it costs nothing."""
     return os.environ.get("OMP_ALLOW_PAID_FALLBACK", "").strip() in ("1", "true", "yes", "on")
 
 
@@ -114,9 +130,11 @@ def _fallbacks_for(role_name: str) -> tuple[str, ...]:
     raw = os.environ.get(key)
     if raw is not None:
         return tuple(m.strip() for m in raw.split(",") if m.strip())
-    if not paid_fallback_enabled():
-        return ()
-    return _FALLBACK_DEFAULTS.get(role_name, ())
+    chain = _FALLBACK_DEFAULTS.get(role_name, ())
+    if paid_fallback_enabled():
+        return chain
+    # Free routes always; metered routes only on an explicit opt-in to spend.
+    return tuple(m for m in chain if not is_paid_route(m))
 
 
 def model_chain(role_name: str) -> tuple[str, ...]:

@@ -104,8 +104,9 @@ print("provider fallback chain:")
 import config
 check("paid fallbacks are OFF by default", not config.paid_fallback_enabled(),
       "an exhausted subscription pauses the factory; it does not spend")
-check("with paid fallback off the chain is subscription-only",
-      config.model_chain('reviewer') == (config.role('reviewer').model,))
+check("with paid fallback off, every route is still FREE",
+      all(not config.is_paid_route(m) for m in config.model_chain('reviewer')),
+      " -> ".join(config.model_chain('reviewer')))
 os.environ['OMP_ALLOW_PAID_FALLBACK'] = '1'
 chain = config.model_chain('reviewer')
 check("reviewer keeps its subscription model first", chain[0] == config.role('reviewer').model, chain[0])
@@ -117,9 +118,12 @@ for _role in ('reviewer', 'test-author', 'product-manager'):
     check(f"{_role} primary names its provider", '/' in _chain[0], _chain[0])
     check(f"{_role} primary is the subscription", _chain[0].startswith('openai-codex/'), _chain[0])
     check(f"{_role} routes are distinct", len(set(_chain)) == len(_chain))
-check("no fallback uses a direct vendor API",
-      all(m.startswith('openrouter/') for m in chain[1:]),
-      "every paid route goes through OpenRouter")
+check("no fallback uses a direct vendor API key",
+      all(m.startswith(config.SUBSCRIPTION_PROVIDERS) or m.startswith('openrouter/')
+          for m in chain[1:]),
+      "subscriptions or OpenRouter only — never a raw vendor key")
+check("every METERED route goes through OpenRouter",
+      all(m.startswith('openrouter/') for m in chain[1:] if config.is_paid_route(m)))
 check("a second family backs up the judge",
       any('openai' not in m and 'gpt' not in m for m in chain[1:]),
       chain[-1])

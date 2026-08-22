@@ -108,7 +108,11 @@ def verify_config() -> None:
     check(not config.paid_fallback_enabled(), "paid fallbacks are off by default")
     for role in ("reviewer", "test-author", "product-manager"):
         chain = config.model_chain(role)
-        check(chain == (config.role(role).model,), f"{role} runs subscription-only unless opted in",
+        # Free routes are always available; only METERED ones need an opt-in to spend. A second
+        # free family is the fix for the single-judge ceiling, so it must survive that gate.
+        check(all(not config.is_paid_route(m) for m in chain),
+              f"{role} spends nothing without an explicit opt-in", " → ".join(chain))
+        check(len(chain) >= 2, f"{role} has a second FREE family, not just a paid backstop",
               " → ".join(chain))
         check(chain[0].startswith("openai-codex/"), f"{role} primary is the subscription", chain[0])
     check(config.model_chain("builder")[0] == config.role("builder").model, "builder is not rerouted")
@@ -119,8 +123,13 @@ def verify_config() -> None:
         chain = config.model_chain(role)
         check(not any("claude" in m or "anthropic" in m for m in chain),
               f"{role} never shares the builder's family (I3)")
-        check(all(m.startswith("openai-codex/") or m.startswith("openrouter/") for m in chain),
-              f"{role} uses no direct vendor API", " → ".join(chain))
+        check(all(m.startswith(config.SUBSCRIPTION_PROVIDERS) or m.startswith("openrouter/")
+                  for m in chain),
+              f"{role} uses no direct vendor API key", " → ".join(chain))
+        check(not any(("claude" in m or "anthropic" in m) for m in chain),
+              f"{role} never lands on the builder's family, even via a multi-model provider")
+        check(any("gemini" in m for m in chain), f"{role} carries a second family (Gemini)",
+              chain[1] if len(chain) > 1 else "-")
     os.environ.pop("OMP_ALLOW_PAID_FALLBACK", None)
 
 
