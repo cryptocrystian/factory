@@ -137,8 +137,15 @@ def poll(since_hours: float = 48.0, limit: int = 200) -> list[str]:
     cutoff = time.time() - since_hours * 3600
     seen, out = _seen(), []
     try:
-        me = (client.pubkey() or "").lower()
-    except Exception:
+        # `pubkey` is a property on BuzzClient, not a method. Calling it raised
+        # TypeError, the bare except swallowed it, and `me` was always empty --
+        # which silently disabled layer 1 below (never act on our own event).
+        me = (client.pubkey or "").lower()
+    except Exception as ex:
+        # Identity is a safety control, so losing it must be visible rather than
+        # quietly downgrading to "trust every author".
+        print(f"  ⚠ cannot determine our own pubkey ({type(ex).__name__}: {ex}); "
+              f"self-authorship check is DISABLED for this pass", flush=True)
         me = ""
     for ch in dict.fromkeys(channels):
         try:
