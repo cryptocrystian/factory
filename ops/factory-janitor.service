@@ -1,0 +1,8 @@
+[Unit]
+Description=Factory janitor — reap orphaned validation containers and finished worktrees
+
+[Service]
+Type=oneshot
+Nice=15
+IOWeight=20
+ExecStart=/root/factory/ops/factory-janitor.sh

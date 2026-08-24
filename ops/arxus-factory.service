@@ -10,11 +10,33 @@ WorkingDirectory=/root/factory
 Environment=TERM=dumb
 Environment=HOME=/root
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin
-# Runs forever: dispatch up to N non-overlapping journeys concurrently, park escalations without
-# stopping. N=2 = the concurrency one subscription sustains; raise once the worker tier scales.
-ExecStart=/root/.local/bin/uv run orchestrator.py --daemon --max-parallel 2 --poll 20
+# Runs forever: dispatch N non-overlapping journeys concurrently, park escalations without stopping.
+#
+# N=1 ON THIS BOX, DELIBERATELY. The VPS has 2 vCPUs and also hosts production (Traefik, Postgres,
+# n8n, the Buzz stack). Each lane runs LLM agents PLUS Node gates — gen:tokens, check:tokens,
+# typecheck, test:unit — in a git worktree, and two concurrent typechecks saturate 2 vCPUs on their
+# own. On 2026-08-24 that pinned both cores at ~88% for 3.5 hours and Hostinger stepped the fair-use
+# cap down hourly (25% -> 50% -> 75% -> 90% steal) until the box ran at ~10% of its rated CPU. The
+# factory was still dispatching while throttled, which kept the cap from lifting.
+#
+# Parallelism is not free here; it is borrowed from the production workload. Raise N only on the
+# worker tier (exe.dev), where a lane gets its own machine.
+ExecStart=/root/.local/bin/uv run orchestrator.py --daemon --max-parallel 1 --poll 20
 Restart=always
 RestartSec=10
+
+# RESOURCE LIMITS — the factory is a CI-shaped workload sharing a box with production. Without
+# these it had CPUQuota=infinity, no CPUWeight and Nice=0, so it could and did starve everything
+# else and trip the host's fair-use cap.
+#   CPUQuota  120% — at most 1.2 of 2 cores, leaving headroom for the containers
+#   CPUWeight   20 — under contention, production wins (default is 100)
+#   Nice        10 — deprioritised against interactive and container work
+#   IOWeight    50 — worktree churn must not starve Postgres I/O
+CPUQuota=120%
+CPUWeight=20
+Nice=10
+IOWeight=50
+MemoryMax=3G
 # Kill the whole cgroup on stop/restart so in-flight journey subprocesses are reaped (no orphans).
 KillMode=control-group
 TimeoutStopSec=30
