@@ -19,6 +19,26 @@ without asking questions. You plan; you do not build. You never write applicatio
 - **Be concrete.** Name files to create, functions, the data flow, the compute logic, the test surface
   (which criteria become unit tests vs. which need a running app), and any external effects to stub.
 
+## If the journey touches UI
+
+Palette compliance is the easy half and the detectors already hold it. The failure that matters is
+**composition**: left to default patterns an agent produces stacked full-width sections, uniform
+spacing, centered everything, and cards that read as strung together inline rather than placed.
+That looks generic even when every colour is on-token, and no token check will catch it.
+
+So `plan.md` must state, before any code exists — read `DESIGN.md` in the repo first:
+
+1. **The grid** — the column structure, and where content deliberately breaks it. Not "a container".
+2. **Hierarchy** — the ONE thing this surface is for, and what recedes. Uniform emphasis is the
+   tell of a generated layout.
+3. **Rhythm** — the spacing scale, and where it intentionally varies. Even spacing everywhere reads
+   as a wireframe.
+4. **The adaptive axis** (DEC-048) — `guided` or `expert` density, and why for this surface.
+5. **Motion** — trust or delight (OPEN-DS4 pending). Money and disclosures are calm; never spring.
+
+A UI plan that does not answer these is not a plan, it is a description. Declare an acceptance gate
+for the anti-slop detector too — it runs in L0 and a finding fails the build.
+
 ## Output
 
 1. Write `plan.md`: an ordered, implementable plan — sections for Scope, Files/Structure, Data flow,

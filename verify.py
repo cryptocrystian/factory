@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -63,8 +64,12 @@ def verify_replay(repo: Path) -> None:
                    "--repo", str(repo), "--journey", "JRN-S1", "--replay", str(REC)])
     check("Traceback" not in out, "replay lane runs without crashing", out.strip().splitlines()[-1][:90] if out else "")
     d = latest_run_dir("JRN-S1")
-    if not d:
-        check(False, "replay produced a run record")
+    if not d or not (d / "trace.jsonl").is_file():
+        # A run dir with no trace means the lane died before its first event — most often because
+        # the target repo was dirty and isolation refused to start (I4). Say that, rather than
+        # exploding on a missing file and hiding the real cause.
+        check(False, "replay produced a run record",
+              f"{d.name if d else 'no run dir'} has no trace.jsonl — is the target repo clean?")
         return
     ev = []
     for line in (d / "trace.jsonl").read_text().splitlines():
@@ -691,6 +696,47 @@ def verify_no_self_ruling() -> None:
           "identity is checked BEFORE any rule is parsed")
 
 
+def verify_design_gate() -> None:
+    """The anti-slop gate must be LIVE, and its allowances must be honest.
+
+    Token checks catch forbidden colours and type sizes; they cannot catch a layout that reads as
+    strung together. The detector can, and it sat dormant — every UI journey shipped with only the
+    token gate. Enabling it is half the work; the other half is that an allowance must never be a
+    quiet way to pass. Rules are never silenced wholesale, and every value allowance carries a
+    reason naming the open question that would retire it."""
+    import json as _json
+    repo = Path(os.path.expanduser("~/projects/arxus"))
+    if not repo.is_dir():
+        return
+    sys.path.insert(0, str(ROOT / "control-plane"))
+    import config  # noqa: E402
+
+    pol = config.design_policy(repo)
+    check(pol is not None, "the repo is opted into the anti-slop gate")
+    check((repo / "DESIGN.md").is_file(), "a ratified DESIGN.md exists")
+    cfgp = repo / ".impeccable" / "config.json"
+    check(cfgp.is_file(), "the detector config exists")
+    if not cfgp.is_file():
+        return
+    cfg = _json.loads(cfgp.read_text()).get("detector", {})
+    check(not cfg.get("ignoreRules"), "no detector RULE is silenced wholesale",
+          str(cfg.get("ignoreRules")))
+    vals = cfg.get("ignoreValues", [])
+    check(bool(vals), "allowances are value-scoped, not rule-scoped")
+    check(all((v.get("reason") or "").strip() for v in vals),
+          "every allowance records WHY it is allowed")
+    provisional = [v for v in vals if "PROVISIONAL" in (v.get("reason") or "")]
+    check(all(re.search(r"OPEN-[A-Z]+\d*", v.get("reason", "")) for v in provisional),
+          "every provisional allowance names the open question that retires it",
+          f"{len(provisional)} provisional")
+    lane = (ROOT / "lanes" / "feature.py").read_text()
+    check("impeccable_gate" in lane and "_l0_gates" in lane,
+          "the gate runs in the L0 tier, beside typecheck")
+    planner = (ROOT / "agents" / "planner" / "system.md").read_text()
+    for word in ("grid", "Hierarchy", "Rhythm", "adaptive axis"):
+        check(word in planner, f"the planner must state the {word.lower()} before building UI")
+
+
 def verify_selftest() -> None:
     rc, out = run(["uv", "run", str(ROOT / "control-plane" / "selftest_k1.py")])
     check(rc == 0 and "ALL PASS" in out, "K1 adapter-spine self-test",
@@ -730,6 +776,7 @@ def main(argv: list[str]) -> int:
     verify_rollback_safety()
     verify_acceptance_ledger()
     verify_no_self_ruling()
+    verify_design_gate()
     verify_shipping_and_concurrency()
     verify_orchestration_table_stakes()
     verify_replay(repo)

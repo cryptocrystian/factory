@@ -18,7 +18,7 @@ repos:
     canon: canon/            # canon lives at repo root
     status: p0               # first by-hand run; no lanes automated yet
     lanes: []                # opt-ins added as lanes come online
-    design:                  # anti-slop gate — DORMANT until taste-intake produces DESIGN.md + config
-      enabled: false
-      detect_paths: app src components
+    design:                  # anti-slop gate — LIVE since 2026-08-24 (DESIGN.md + .impeccable/config.json ratified)
+      enabled: true
+      detect_paths: app components
       impeccable_version: "3.5.0"
