@@ -664,6 +664,33 @@ def verify_acceptance_ledger() -> None:
           "the planner is asked to declare them up front")
 
 
+def verify_no_self_ruling() -> None:
+    """The factory must never answer its own escalations.
+
+    Every escalation posts the reply syntax so the owner need not remember it. The Buzz ingester
+    then read the channel, matched those TEMPLATE lines in the factory's own post, and applied them
+    as rulings — approve, then reject. Items were auto-ruled, flipped back to ready and
+    re-dispatched, while the owner's queue showed nothing open. Between 2026-08-22 and 08-24 the
+    factory decided four of its own escalations that way."""
+    sys.path.insert(0, str(ROOT / "control-plane"))
+    import buzz_rulings as br  # noqa: E402
+
+    post = ("⚑ DECISION — jrn-b1\nQ: contract both vendors?\n"
+            "To rule it, reply in this channel:\n"
+            "    RULE jrn-b1: approve <your ruling>\n"
+            "    RULE jrn-b1: reject <why>")
+    check(br.looks_like_factory_post(post), "an escalation post is recognised as NOT a ruling")
+    check(br.is_template_line("RULE jrn-b1: approve <your ruling>"),
+          "a placeholder line is recognised as a template")
+    check(not br.is_template_line("RULE jrn-b1: approve activate both vendors"),
+          "a real ruling is still accepted")
+    src = (ROOT / "control-plane" / "buzz_rulings.py").read_text()
+    check("author == me" in src, "an event we authored is never treated as a ruling")
+    check("looks_like_factory_post(content)" in src, "escalation posts are skipped wholesale")
+    check(src.index("if me and author == me") < src.index("for m in RULE.finditer(content)"),
+          "identity is checked BEFORE any rule is parsed")
+
+
 def verify_selftest() -> None:
     rc, out = run(["uv", "run", str(ROOT / "control-plane" / "selftest_k1.py")])
     check(rc == 0 and "ALL PASS" in out, "K1 adapter-spine self-test",
@@ -702,6 +729,7 @@ def main(argv: list[str]) -> int:
     verify_escalation_payload()
     verify_rollback_safety()
     verify_acceptance_ledger()
+    verify_no_self_ruling()
     verify_shipping_and_concurrency()
     verify_orchestration_table_stakes()
     verify_replay(repo)
