@@ -40,7 +40,12 @@ SEEN = FACTORY_ROOT / "runs" / ".buzz-rulings-seen"
 BACKLOG_HEADER = "# Factory backlog — the orchestrator's work queue. Edit status to re-open an item.\n"
 DECISIONS_HEADER = "# Decisions queue — escalations + ratifications awaiting the human.\n"
 
-RULE = re.compile(r"^\s*RULE\s+([A-Za-z0-9_.\-]+)\s*:\s*(approve|reject)\b\s*(.*)$",
+# `[^\S\n]` is horizontal whitespace only. Plain `\s*` also matches a newline, so
+# a ruling with no note ("RULE jrn-a1: approve") lets the trailing `(.*)` swallow
+# the NEXT line: two rulings merge into one, the second is silently never
+# applied, and the first records the swallowed line as its note.
+RULE = re.compile(r"^[^\S\n]*RULE[^\S\n]+([A-Za-z0-9_.\-]+)[^\S\n]*:[^\S\n]*"
+                  r"(approve|reject)\b[^\S\n]*(.*)$",
                   re.IGNORECASE | re.MULTILINE)
 
 # A ruling must come from a HUMAN, and the factory must never rule itself.
