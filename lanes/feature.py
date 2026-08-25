@@ -438,6 +438,7 @@ class Lane:
     def _l0_gates(self):
         """The deterministic L0 command gates, plus the anti-slop design gate for opted-in repos."""
         gs = [gates.cmd_gate("check:tokens", "npm run gen:tokens >/dev/null 2>&1; npm run check:tokens"),
+              gates.cmd_gate("check:composition", "npm run check:composition"),
               gates.cmd_gate("typecheck", "npm run typecheck")]
         if self.design:
             gs.append(gates.impeccable_gate(self.design.impeccable_version, self.design.detect_paths))
@@ -449,7 +450,20 @@ class Lane:
             return ""
         return (f" This repo enforces the anti-slop design gate: run "
                 f"`npx impeccable detect {self.design.detect_paths}` and clear every finding, "
-                f"honoring DESIGN.md and .impeccable/config.json.")
+                f"honoring DESIGN.md and .impeccable/config.json."
+                " It also enforces a COMPOSITION contract via `npm run check:composition`."
+                " On marketing surfaces (app/page.tsx and app/(marketing)/**) every <section> must"
+                ' declare its composition explicitly: data-layout="centered|left|right|full|split"'
+                ' and data-enter="fade-up|slide-left|slide-right|scale-up|clip-reveal".'
+                " At least 4 sections, at least 3 distinct layouts, no two consecutive sections"
+                " sharing a layout, no two sections sharing an entrance animation, at least one"
+                " data-pin section and one data-marquee element; any data-stat must carry"
+                " data-countup. Do not wrap marketing text in <Card> or frosted/blurred containers"
+                " -- type hierarchy and spacing are the structure. These rules are deliberately"
+                " scoped OUT of application routes: do not apply oversized heroes, pinning or"
+                " marquees to dashboards or forms. Declare the layout you actually intend; the"
+                " gate checks the declaration, so a wrong declaration is a lie the reviewer will"
+                " catch.")
 
     def _test(self, run, prompt=None) -> tuple[bool, str]:
         self._agent(run, "test-author", "test",
