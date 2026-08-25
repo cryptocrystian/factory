@@ -107,9 +107,30 @@ _FALLBACK_DEFAULTS: dict[str, tuple[str, ...]] = {
 # available; only metered routes are gated behind an explicit opt-in to spend.
 SUBSCRIPTION_PROVIDERS = ("openai-codex/", "anthropic/", "google-antigravity/", "google-gemini-cli/")
 
+# THE THIRD CLASS. "subscription vs paid" was a true binary until Fable 5 landed on the Max plan
+# (owner's notice, 2026-08-25): included in the subscription, but capped at HALF the weekly limit,
+# drawing that limit down FASTER than other models, and rolling over to billable usage credits once
+# spent. So it is subscription-backed AND separately exhaustible AND overage-billable.
+#
+# Left unclassified it reads as `anthropic/` -> is_paid_route() False -> "free, always available",
+# which switches OFF both the spend guard and the paid-fallback opt-in exactly where real money
+# starts. That is the 2026-08-19 overnight-billing failure with the polarity reversed, and it would
+# be invisible in the trace: the route name never changes when the plan flips to credits.
+METERED_SUBSCRIPTION_MODELS = ("claude-fable-5",)
+
+# Roles the factory runs on EVERY cycle. A metered-subscription model here drains a limit that is
+# already only half the plan's, starving the roles that actually ship code.
+HIGH_VOLUME_ROLES = ("planner", "builder", "test-author", "reviewer")
+
 
 def is_paid_route(model: str) -> bool:
     return not model.startswith(SUBSCRIPTION_PROVIDERS)
+
+
+def is_metered_subscription(model: str) -> bool:
+    """Inside the subscription, but with its own ceiling and billable overage past it."""
+    tail = model.split("/")[-1]
+    return tail in METERED_SUBSCRIPTION_MODELS
 
 
 def paid_fallback_enabled() -> bool:
@@ -193,6 +214,18 @@ def validate_roles(names) -> None:
     missing = [n for n in names if n not in ROLES]
     if missing:
         raise KeyError(f"unknown role(s) {missing}; roster has {sorted(ROLES)}")
+
+    # A metered-subscription model on a per-cycle role burns a half-sized weekly ceiling and then
+    # bills. Confine it to the low-volume judgment roles, where it runs on escalation, not always.
+    for n in names:
+        m = ROLES[n].model
+        if is_metered_subscription(m) and n in HIGH_VOLUME_ROLES:
+            raise ValueError(
+                f"role {n!r} is assigned {m!r}, a metered-subscription model, but {n!r} runs every "
+                f"cycle. Metered models are capped at half the weekly limit, draw it down faster, "
+                f"and bill as usage credits past it. Confine them to low-volume roles "
+                f"(not {list(HIGH_VOLUME_ROLES)})."
+            )
 
 
 def role(name: str) -> Role:
