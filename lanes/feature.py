@@ -437,7 +437,13 @@ class Lane:
 
     def _l0_gates(self):
         """The deterministic L0 command gates, plus the anti-slop design gate for opted-in repos."""
-        gs = [gates.cmd_gate("check:tokens", "npm run gen:tokens >/dev/null 2>&1; npm run check:tokens"),
+        # test:gates runs FIRST and deliberately: it is the fixture suite for the gates themselves.
+        # A gate is the most safety-critical code in a repo -- it decides what ships -- and it can be
+        # wrong in two silent directions (a false positive blocks correct work, a false negative
+        # passes slop). Verifying the instrument before trusting its reading is what keeps gate bugs
+        # from being discovered reactively, one shipped defect at a time.
+        gs = [gates.cmd_gate("test:gates", "npm run test:gates"),
+              gates.cmd_gate("check:tokens", "npm run gen:tokens >/dev/null 2>&1; npm run check:tokens"),
               gates.cmd_gate("check:composition", "npm run check:composition"),
               gates.cmd_gate("typecheck", "npm run typecheck")]
         if self.design:
@@ -452,18 +458,24 @@ class Lane:
                 f"`npx impeccable detect {self.design.detect_paths}` and clear every finding, "
                 f"honoring DESIGN.md and .impeccable/config.json."
                 " It also enforces a COMPOSITION contract via `npm run check:composition`."
-                " On marketing surfaces (app/page.tsx and app/(marketing)/**) every <section> must"
-                ' declare its composition explicitly: data-layout="centered|left|right|full|split"'
-                ' and data-enter="fade-up|slide-left|slide-right|scale-up|clip-reveal".'
-                " At least 4 sections, at least 3 distinct layouts, no two consecutive sections"
-                " sharing a layout, no two sections sharing an entrance animation, at least one"
-                " data-pin section and one data-marquee element; any data-stat must carry"
-                " data-countup. Do not wrap marketing text in <Card> or frosted/blurred containers"
-                " -- type hierarchy and spacing are the structure. These rules are deliberately"
-                " scoped OUT of application routes: do not apply oversized heroes, pinning or"
-                " marquees to dashboards or forms. Declare the layout you actually intend; the"
-                " gate checks the declaration, so a wrong declaration is a lie the reviewer will"
-                " catch.")
+                " On marketing surfaces (app/page.tsx and app/(marketing)/**) FORM FOLLOWS FUNCTION:"
+                ' every <section> declares what it IS via data-role, and the gate checks that its'
+                " form is one that function permits. Roles: hero, steps, compare, stats, proof,"
+                " detail, disclosure, cta. A compare section must be split because that is what"
+                " comparing is; a stats section must be full because magnitudes need room; a"
+                " disclosure section may only use the calm fade-up entrance because it concerns"
+                " money (DEC-048); a steps section must carry data-pin so the sequence holds while"
+                " its steps advance. Repeating a role, a layout or an entrance is entirely legal"
+                " when the function repeats -- do NOT vary form for the sake of variety, which is"
+                " randomness, not design. The page must open with hero, close with cta, use at"
+                " least 3 distinct layouts across at least 4 sections, and never run more than 2"
+                " consecutive sections in the same layout. Any data-stat needs data-countup. Do not"
+                " wrap marketing text in <Card> or frosted containers -- type hierarchy and spacing"
+                " are the structure. These rules are scoped OUT of application routes: never apply"
+                " oversized heroes, pinning or marquees to dashboards or forms. Read"
+                " scripts/check-composition.mjs for the role table; it states the rationale for"
+                " each permitted form. Declare the role you actually built; the gate checks the"
+                " declaration, so a false declaration is a lie the reviewer will catch.")
 
     def _test(self, run, prompt=None) -> tuple[bool, str]:
         self._agent(run, "test-author", "test",
