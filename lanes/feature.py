@@ -85,7 +85,7 @@ def _fingerprint(findings) -> str:
 MAX_FIX_ITERS = 3          # bounded builder fix loop (I9): converge or escalate
 MAX_ARCH_ROUNDS = 4        # bounded architect authority loop: enough rounds to close a lockdown cascade
 
-import config, omp, gates, ledger, meter, permissions as perm
+import config, omp, gates, ledger, meter, quota, permissions as perm
 import envelopes as E
 from canon import CanonResolver
 from session import Run
@@ -221,11 +221,31 @@ class Lane:
         self._agent_gates_ok = True
         self._human_brief = None                 # set by the architect when it surfaces a decision
         config.validate_roles(LANE_ROLES)                 # hard rule 1: fail before anything spawns
+        # Subscription meters are shared with the owner's other ventures and their own sessions, so
+        # a plan-wide "42% used" says nothing about whether THIS factory earns its quota. Sampling
+        # around the run turns that into an attributable number. Live runs only: a replay spends
+        # nothing, and recording a delta for it would poison the attribution.
+        quota_before = quota.as_dict(quota.snapshot()) if self.live else {}
         run.tracer.log(event_detail="lane_start", journey=self.journey, mode="live" if self.live else "replay")
         try:
             return self._feature_phases(run)
         except PhaseUnavailable as e:
             return self._abort(run, e)
+        finally:
+            self._record_quota(run, quota_before)
+
+    def _record_quota(self, run, before: dict) -> None:
+        """Attribute this run's share of the subscription. Never allowed to fail a run: it is
+        observability, and a broken meter read must not change a delivery verdict."""
+        if not before:
+            return
+        try:
+            spent = quota.delta(before, quota.as_dict(quota.snapshot()))
+            if spent:
+                run.tracer.log(event_detail="quota_spent", meters=spent,
+                               metered=[k for k in spent if quota.FABLE_HINT in k.lower()])
+        except Exception as ex:
+            run.tracer.log(event_detail="quota_unavailable", error=str(ex)[:200])
 
     def _feature_phases(self, run) -> bool:
         run._started_at = time.monotonic()
