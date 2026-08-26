@@ -58,10 +58,19 @@ class NullNotifier(Notifier):
 class BuzzNotifier(Notifier):
     enabled = True
 
-    def __init__(self, client, channels, events):
+    def __init__(self, client, channels, events, owner_pubkey=None):
         self.client = client
         self.channels = channels or {}
         self.events = events if events is not None else {}
+        # Addressed to a person, not just posted to a room. Without this an escalation is a message
+        # in a channel nobody is watching, which is how JRN-B1 and JRN-G1 sat unruled.
+        self.owner_pubkey = owner_pubkey
+
+    def _escalation_channel(self):
+        """Decisions go to the owner's inbox (the workspace escalations channel), not the project's
+        work channel. Progress belongs with the work; a thing that BLOCKS belongs where the owner
+        looks for things that block. Falls back to the project channel if no inbox is configured."""
+        return self.channels.get("escalations") or self.channels.get("default")
 
     def _channel(self, project, facet="home"):
         """Resolve (project/initiative, facet/track) -> channel UUID. Supports both the nested
@@ -75,13 +84,13 @@ class BuzzNotifier(Notifier):
             return ch
         return self.channels.get("default")
 
-    def post(self, project=None, text="", facet="home"):
-        ch = self._channel(project, facet)
+    def post(self, project=None, text="", facet="home", mentions=None, channel=None):
+        ch = channel or self._channel(project, facet)
         if not ch:
             print(f"  (notifier: no channel for project={project!r} facet={facet!r}, skipping)", file=sys.stderr)
             return None
         try:
-            return self.client.send_message(ch, text)
+            return self.client.send_message(ch, text, mentions=mentions)
         except Exception as e:  # never break the run
             print(f"  (notifier: post to {project} failed: {e})", file=sys.stderr)
             return None
@@ -104,7 +113,7 @@ class BuzzNotifier(Notifier):
                       "To rule it, reply in this channel:",
                       f"    RULE {item_id}: approve <your ruling>",
                       f"    RULE {item_id}: reject <why>"]
-            return self.post(project, "\n".join(lines), facet="product")
+            return self._route(project, item_id, "\n".join(lines))
         lines = [f"⚑ ESCALATION — {item_id}",
                  f"project: {project} · kind: {kind}"]
         if note:
@@ -124,7 +133,21 @@ class BuzzNotifier(Notifier):
                   f"To rule it, reply in this channel:",
                   f"    RULE {item_id}: approve <your ruling>",
                   f"    RULE {item_id}: reject <why>"]
-        return self.post(project, "\n".join(lines), facet="product")
+        return self._route(project, item_id, "\n".join(lines))
+
+    def _route(self, project, item_id, body):
+        """Full decision into the escalations inbox, addressed to the owner; a one-line pointer into
+        the project's work channel so the stream still shows the run stalled and why."""
+        inbox = self._escalation_channel()
+        work = self._channel(project, "product")
+        mentions = [self.owner_pubkey] if self.owner_pubkey else None
+        if not inbox or inbox == work:
+            return self.post(project, body, facet="product", mentions=mentions)
+        res = self.post(text=body, channel=inbox, mentions=mentions)
+        if work:
+            self.post(text=f"⚑ {item_id} needs a ruling — posted to #factory-escalations",
+                      channel=work)
+        return res
 
     def accepted(self, *, project, item_id, kind, note, run_id):
         if not self.events.get("accepted", True):
@@ -148,7 +171,8 @@ def get_notifier() -> Notifier:
             sys.path.insert(0, str(CP))
         from buzz import BuzzClient
         client = BuzzClient.from_env()
-        return BuzzNotifier(client, cfg.get("channels"), cfg.get("events"))
+        return BuzzNotifier(client, cfg.get("channels"), cfg.get("events"),
+                            owner_pubkey=cfg.get("owner_pubkey"))
     except Exception as e:
         print(f"  (notifier: Buzz unavailable, degrading to file-only: {e})", file=sys.stderr)
         return NullNotifier()

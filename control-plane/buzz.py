@@ -231,9 +231,18 @@ class BuzzClient:
         """POST /events with a signed Nostr event."""
         return self._post("/events", event)
 
-    def send_message(self, channel_uuid: str, text: str) -> object:
-        ev = build_event(self.seckey, KIND_STREAM_MESSAGE,
-                         [["h", channel_uuid]], text)
+    def send_message(self, channel_uuid: str, text: str, mentions=None) -> object:
+        """Post to a channel. `mentions` is a list of pubkey hex to address the message to.
+
+        A message tagged only with its channel (`h`) is addressed to nobody: it lands in the room
+        and waits to be noticed. Nostr's convention for "this concerns you" is a `p` tag, which is
+        what a client turns into a mention and a notification. Escalations that nobody is told about
+        are escalations that sit for days, so anything needing a ruling MUST carry one."""
+        tags = [["h", channel_uuid]]
+        for pk in (mentions or []):
+            if pk:
+                tags.append(["p", pk.lower()])
+        ev = build_event(self.seckey, KIND_STREAM_MESSAGE, tags, text)
         return self.publish(ev)
 
     def read_channel(self, channel_uuid: str, limit: int = 20) -> list:

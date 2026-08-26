@@ -2,7 +2,12 @@
 # channels.<initiative> is a facet->UUID map (the (initiative, track) routing, B11);
 # channels.default is the global escalations fallback. adapter/events are hand-set.
 adapter: buzz
+# The owner's npub-hex. Escalations are ADDRESSED to a person (Nostr `p` tag), not merely posted:
+# an unaddressed message is one nobody is told about, which is how JRN-B1 and JRN-G1 sat unruled.
+owner_pubkey: 86fd81bbb59bc501a78435677255adab7961ae57329ae7446741bbd44f92af81
 channels:
+  # #factory-escalations — the owner's decision inbox. Anything that BLOCKS lands here.
+  escalations: cee4c3ba-d3e4-480c-90d8-1d4f883cf4b0
   default: cee4c3ba-d3e4-480c-90d8-1d4f883cf4b0
   arxus:
     home: c050feab-41bb-4fae-ba12-c7888d6a119e
