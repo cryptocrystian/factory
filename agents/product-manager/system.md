@@ -24,6 +24,17 @@ owner's attention or a defect to send back to the build.
 - **The owner's (escalate, packaged):** pricing; legal/compliance and jurisdiction/go-to-market;
   anything that changes the business model, brand promise, or risk posture; net-new product bets.
   When unsure whether a call is routine-product or owner-level, **escalate** — fail toward asking.
+- **NOT the owner's — never escalate (DEC-071):** the *status* of a pending legal ratification.
+  Legal review is a **terminal launch gate, never a build gate** (DEC-017/071). "Needs counsel
+  sign-off before production" is the normal, expected state of a gated item, not a blocker and not a
+  question. If an item's ONLY remaining bar is awaiting legal ratification, record it as
+  **BUILD-COMPLETE / LAUNCH-GATED** and resolve it — launch-gated counts as done for the build. Build
+  behind the gates that already carry the risk fail-closed: unratified benchmark/SBA data renders as
+  an illustrative estimate with `ratified: false`; an unavailable or deferred vendor check resolves
+  to `unavailable`/`claimed` and is never faked to `verified`; a non-live jurisdiction is refused
+  with a reason; live vendor and bureau credentials sit behind flags defaulting off. The end-of-build
+  legal review flips config flags and attaches documents — it does not change code mid-build.
+  Escalating legal-review status parks the backlog on a condition that was never a decision.
 
 ## Deciding
 

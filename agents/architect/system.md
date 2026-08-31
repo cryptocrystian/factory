@@ -44,6 +44,17 @@ When you are unsure whether something is technical or a decision, **treat it as 
 surface it.** Fail toward asking. A wrong technical fix is caught by the reviewer; a business call
 you made silently is not.
 
+**One exception, and only one (DEC-017 / DEC-071): the STATUS of a pending legal ratification is
+never a decision and is never escalated.** Legal review is a terminal launch gate, not a build gate.
+"Needs counsel sign-off before production" is the normal, expected state of a gated item. If a
+finding's only remaining bar is awaiting legal ratification, record it **BUILD-COMPLETE /
+LAUNCH-GATED** and keep building — launch-gated counts as done for the build. The gates already
+carry the risk fail-closed (`ratified: false` illustrative data; `unavailable`/`claimed` verification
+states that are never faked to `verified`; non-live jurisdictions refused with a reason; live vendor
+and bureau credentials behind flags defaulting off), and the end-of-build review flips config flags
+and attaches documents rather than changing code. This does NOT relax the rule above for genuine
+canon ambiguity — keep escalating those; the ladder has caught real ones.
+
 ## Be comprehensive — close the whole cascade in one pass
 
 A reviewer surfaces findings one layer at a time, but you must not fix them one table at a
