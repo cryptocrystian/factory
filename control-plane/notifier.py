@@ -13,6 +13,7 @@ Config: factory/notify.yml
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -21,7 +22,11 @@ import yaml
 CP = Path(__file__).resolve().parent
 FACTORY_ROOT = CP.parent
 NOTIFY_CFG = FACTORY_ROOT / "notify.yml"
-OBSERVE_URL = "http://localhost:7788"
+# The observatory binds to the TAILNET address (ops/factory-observatory.service), never localhost:
+# the factory runs on the VPS, so "localhost" resolves on the OWNER'S machine, where nothing is
+# listening. Every escalation ever sent carried that dead link, which is why the dashboard was
+# believed to be down for weeks while it was serving fine. Overridable for a different tailnet.
+OBSERVE_URL = os.environ.get("FACTORY_OBSERVE_URL", "http://100.103.168.32:7788")
 
 
 def _load_cfg() -> dict:
@@ -101,18 +106,31 @@ class BuzzNotifier(Notifier):
             return None
         hb = human_brief or {}
         if hb.get("question"):
-            lines = [f"⚑ DECISION — {item_id}", f"project: {project} · kind: {kind}", "",
-                     f"Q: {hb['question']}"]
+            # Written to be RULED IN ONE READ, on a phone, without opening anything else: the
+            # question, what it turns on, the options as consequences, and a copy-paste reply per
+            # option. An escalation that requires research before it can be answered is why
+            # decisions sat for days.
+            opts = hb.get("options") or []
+            lines = [f"⚑ DECISION NEEDED — {item_id}   ({project})", "",
+                     hb["question"], ""]
             if hb.get("why"):
-                lines += ["", f"Why: {hb['why']}"]
-            for i, opt in enumerate(hb.get("options") or [], 1):
-                lines.append(f"  {i}. {opt}")
+                lines += ["WHY THIS IS YOURS", f"  {hb['why']}", ""]
+            if opts:
+                lines.append("YOUR OPTIONS")
+                for i, opt in enumerate(opts, 1):
+                    lines.append(f"  {i}. {opt}")
+                lines.append("")
             if hb.get("recommendation"):
-                lines += ["", f"Recommendation: {hb['recommendation']}"]
-            lines += ["", f"Run: {run_id}", f"Observatory: {url or OBSERVE_URL}", "",
-                      "To rule it, reply in this channel:",
-                      f"    RULE {item_id}: approve <your ruling>",
-                      f"    RULE {item_id}: reject <why>"]
+                lines += ["RECOMMENDED", f"  {hb['recommendation']}", ""]
+            lines.append("TO RULE IT — reply with ONE line, copy-paste:")
+            if opts:
+                for i in range(1, len(opts) + 1):
+                    lines.append(f"    RULE {item_id}: approve option {i}")
+            else:
+                lines.append(f"    RULE {item_id}: approve <your ruling>")
+            lines += [f"    RULE {item_id}: reject <why>", "",
+                      f"Or click through: {url or OBSERVE_URL}",
+                      f"Run: {run_id}"]
             return self._route(project, item_id, "\n".join(lines))
         lines = [f"⚑ ESCALATION — {item_id}",
                  f"project: {project} · kind: {kind}"]
