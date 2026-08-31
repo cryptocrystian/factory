@@ -81,11 +81,13 @@ def repo_path(name: str) -> str:
 
 
 def ready(items):
-    """Dispatchable = ready, or blocked with every dependency now accepted (blocked→ready transition).
+    """Dispatchable = ready, or blocked with every dependency now accepted (blocked→ready transition),
+    or held on infrastructure (a provider outage is not a verdict, so it must not need a human to
+    clear it — the JudgeGate preflight already refuses to dispatch while no judge route is up).
     Decisions (awaiting_human) and escalated items are never auto-dispatched — they wait on you."""
     done = {i["id"] for i in items if i.get("status") in DONE}
     return [i for i in items
-            if i.get("status") in ("ready", "blocked")
+            if i.get("status") in ("ready", "blocked", "infra_hold")
             and all(d in done for d in (i.get("depends_on") or []))]
 
 
@@ -230,10 +232,32 @@ def _queue_decision(item, run_id, blocking, human_brief=None):
                      default={"decisions": []})
 
 
-def escalate(item, run_id, blocking, human_brief=None):
-    _queue_decision(item, run_id, blocking, human_brief)
+def escalate(item, run_id, blocking, human_brief=None, operational=False):
+    """Write the escalation bundle. `operational=True` means INFRASTRUCTURE, not judgment.
+
+    A rate-limited provider is not a thing a human can rule. Queuing it as a decision put
+    "repeated transient infra failure (model overloaded / no envelope)" in front of the owner as
+    though it were a ruling, and parked every dependent behind it — JRN-B1 held b4/m1/f1 (and s5,
+    t1, t2, n1, n2 behind those) on a condition that had already cleared by itself. Operational
+    holds notify, but they never enter the decisions queue and they reopen on their own."""
+    if not operational:
+        _queue_decision(item, run_id, blocking, human_brief)
     ESC_DIR.mkdir(parents=True, exist_ok=True)
     p = ESC_DIR / f"{item['id']}.md"
+    if operational:
+        p.write_text("\n".join([
+            f"# Infrastructure hold — {item['id']}", "",
+            f"**Item:** {item.get('note','')}",
+            f"**Kind:** {item['kind']} · **Repo:** {item.get('repo','—')} · **Run:** `{run_id}`", "",
+            "**There is no ruling to make here.** The run did not fail on its merits — a provider was",
+            "unavailable (rate limited, overloaded, or returning no envelope) for every retry.", "",
+            "Cause:", *[f"- {b}" for b in (blocking or ["provider unavailable"])], "",
+            "## What happens next",
+            "This item is on an infrastructure hold, not an escalation. The daemon reopens it",
+            "automatically once a judge route is healthy again; no action is needed from you.",
+            "Check provider headroom with `python3 control-plane/quota.py`.", "",
+            f"Run detail: {run_id}"]))
+        return p
     lines = [f"# Escalation — {item['id']}", "",
              f"**Item:** {item.get('note','')}",
              f"**Kind:** {item['kind']} · **Repo:** {item.get('repo','—')} · **Run:** `{run_id}`", "",
@@ -492,11 +516,19 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
                         why = f"provider cooldown {int(cooldown)}s" if cooldown > min(60 * n, 600) else "transient infra failure"
                         print(f"  ↻ retry     {iid}  ({why}, attempt {n}, backoff {back}s)", flush=True)
                     else:
-                        item["status"] = "escalated"; pending[iid] = {"status": "escalated"}
-                        escalate(item, run_id, ["repeated transient infra failure (model overloaded / no envelope)"])
-                        nt.escalation(project=item.get("repo", "—"), item_id=iid, kind=item["kind"],
-                                      note=item.get("note", ""), run_id=run_id, blocking=["repeated infra failure"])
-                        print(f"  ⚑ escalated {iid}  (infra x{n} — needs a look)", flush=True)
+                        # NOT "escalated": there is nothing here for a human to rule, and marking it
+                        # so parks every dependent until someone notices. infra_hold is dispatchable
+                        # again as soon as a judge route is healthy (see ready()).
+                        item["status"] = "infra_hold"; pending[iid] = {"status": "infra_hold"}
+                        escalate(item, run_id,
+                                 ["repeated transient infra failure (model overloaded / no envelope)"],
+                                 operational=True)
+                        nt.post(project=item.get("repo", "—"),
+                                text=(f"⏸ {iid} on INFRASTRUCTURE HOLD after {n} provider failures. "
+                                      f"No ruling needed — it reopens automatically when a judge route "
+                                      f"is healthy. Run: {run_id}"),
+                                facet="product")
+                        print(f"  ⏸ infra-hold {iid}  (infra x{n} — reopens when providers recover)", flush=True)
                 elif accepted and not merged:                # lost the merge race on a moving base (I11)
                     conflicts += 1                           # decomposition-gate feedback signal
                     n = merge_retries.get(iid, 0) + 1; merge_retries[iid] = n
