@@ -604,6 +604,7 @@ display:flex;align-items:center;gap:10px;margin:6px 0 2px}
 /* needs-you band: the one thing that must not look like everything else */
 .fdec{border-left:3px solid var(--accent);background:color-mix(in srgb,var(--accent) 8%,transparent);
   padding:14px 18px;border-radius:0 6px 6px 0;margin-bottom:10px}
+.fdec{user-select:text;-webkit-user-select:text}
 .fdec .q{font-size:15px;color:var(--fg);margin:0 0 8px;line-height:1.45}
 .fdec .w{font-size:12.5px;color:var(--txt-dim,var(--dim));margin:0 0 12px;line-height:1.5}
 .fdec .opts{display:flex;flex-direction:column;gap:6px;margin-bottom:12px}
@@ -910,6 +911,23 @@ function roleColor(o){return ROLECOLOR[o]||"#6b7686"}
 function dur(a,b){const s=Math.max(0,(b-a));if(s<90)return Math.round(s)+"s";
   const m=s/60;return m<90?Math.round(m)+"m":(m/60).toFixed(1)+"h"}
 
+
+function copyText(txt,btn){
+  const done=()=>{const o=btn.textContent;btn.textContent="Copied";
+    setTimeout(()=>{btn.textContent=o},1400)};
+  if(navigator.clipboard&&window.isSecureContext){
+    navigator.clipboard.writeText(txt).then(done).catch(()=>fallback());
+  } else fallback();
+  function fallback(){
+    // http:// over the tailnet is not a secure context, so navigator.clipboard is absent there.
+    const ta=document.createElement("textarea");
+    ta.value=txt;ta.style.position="fixed";ta.style.opacity="0";
+    document.body.append(ta);ta.select();
+    try{document.execCommand("copy");done()}catch(e){alert("Copy failed - select the text manually")}
+    ta.remove();
+  }
+}
+
 function renderFactory(f){
   const box=$("#factoryview");box.innerHTML="";
   const wrap=el("div","fv");
@@ -983,6 +1001,27 @@ function renderFactory(f){
         card.append(ob);
       }
       const acts=el("div","acts");
+      const cp=el("button","fbtn","Copy");
+      cp.onclick=()=>{
+        const L=[];
+        L.push("DECISION — "+(d.backlog_id||d.id));
+        if(d.repo&&d.repo!=="\u2014")L.push("project: "+d.repo);
+        L.push("");
+        L.push(d.finding||"(no question recorded)");
+        if(d.why){L.push("");L.push("WHY THIS IS OURS");L.push("  "+d.why)}
+        if(opts.length){L.push("");L.push("OPTIONS");
+          opts.forEach((o,i)=>L.push("  "+(i+1)+". "+o))}
+        if(d.recommendation){L.push("");L.push("RECOMMENDED");L.push("  "+d.recommendation)}
+        if(d.blocking&&d.blocking.length){L.push("");L.push("BLOCKING FINDINGS");
+          d.blocking.forEach(b=>L.push("  - "+b))}
+        L.push("");L.push("TO RULE IT");
+        if(opts.length){opts.forEach((o,i)=>L.push("    RULE "+(d.backlog_id||d.id)+": approve option "+(i+1)))}
+        else L.push("    RULE "+(d.backlog_id||d.id)+": approve <ruling>");
+        L.push("    RULE "+(d.backlog_id||d.id)+": reject <why>");
+        if(d.run_id){L.push("");L.push("run: "+d.run_id)}
+        copyText(L.join("\n"),cp);
+      };
+      acts.append(cp);
       opts.forEach((o,i)=>{
         const b=el("button","fbtn"+(i===0?" go":""),"Approve "+(i+1));
         b.onclick=()=>{if(!confirm("Approve option "+(i+1)+"?\n\n"+o))return;
@@ -1039,9 +1078,23 @@ function renderFactory(f){
 
   box.append(wrap);
 }
+let lastFactorySig="";
+function selectionInside(node){
+  const sel=window.getSelection();
+  if(!sel||sel.isCollapsed||!sel.rangeCount)return false;
+  return node.contains(sel.getRangeAt(0).commonAncestorContainer);
+}
 function pollFactory(){return fetch("/api/factory").then(r=>r.json()).then(f=>{
-  factoryState=f; pending=(f.decisions||[]).length;
-  if(mode==="factory")renderFactory(f); renderNav();
+  factoryState=f; pending=(f.decisions||[]).length; renderNav();
+  if(mode!=="factory")return;
+  // Two reasons NOT to repaint. (a) Nothing changed: a 2s innerHTML rebuild of an identical tree
+  // destroys any in-progress text selection, which is why highlighting a decision "kept selecting
+  // the whole page" -- the anchor was being ripped out from under the drag. (b) The reader is
+  // mid-selection: never repaint under them, even if data DID change.
+  const sig=JSON.stringify(f);
+  if(sig===lastFactorySig)return;
+  if(selectionInside($("#factoryview")))return;
+  lastFactorySig=sig; renderFactory(f);
 }).catch(()=>{})}
 
 function renderNav(){
