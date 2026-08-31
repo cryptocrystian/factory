@@ -654,6 +654,35 @@ def verify_classification() -> None:
     check("ruled" not in dispatchable,
           "a real escalation still waits on the owner")
 
+    # --- a decision vs unfinished engineering --------------------------------------------------
+    # Both exit through Lane._unresolved. Only one is the owner's: a defect is not a question.
+    sys.path.insert(0, str(ROOT / "lanes"))
+    import feature
+
+    class _Tracer:
+        def __init__(self): self.events = []
+        def log(self, **kw): self.events.append(kw.get("event_detail"))
+
+    class _Run:
+        def __init__(self): self.tracer = _Tracer(); self.dir = ROOT
+
+    class _Stub:
+        """Minimal stand-in: the exit's routing depends only on _human_brief."""
+        def __init__(self, hb): self._human_brief = hb
+        def _pm_triage(self, run): return False
+        def _converge(self, run, f, e): return False
+
+    r1 = _Run()
+    feature.Lane._unresolved(_Stub({}), r1, ["endpoint writes a table the migration forbids"])
+    check("technical_unresolved" in r1.tracer.events and "architect_not_resolved" not in r1.tracer.events,
+          "unclosed technical findings are REWORK, not the owner's",
+          "a defect is not a question; no ruling can settle it")
+
+    r2 = _Run()
+    feature.Lane._unresolved(_Stub({"question": "seller-invited-only at launch?"}), r2, [])
+    check("architect_not_resolved" in r2.tracer.events and "technical_unresolved" not in r2.tracer.events,
+          "a surfaced decision still reaches the owner")
+
     # --- the factory's own voice vs an inbound command -----------------------------------------
     check(buzz_rulings.looks_like_factory_post("⚑ ESCALATION — jrn-b1\nproject: arxus"),
           "the factory recognises its own escalation post")

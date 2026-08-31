@@ -624,7 +624,7 @@ class Lane:
             return True
         for i in range(1, MAX_ARCH_ROUNDS + 1):
             if self._budget_spent(run):
-                return self._unresolved(run)
+                return self._unresolved(run, findings)
             (run.dir / f"arch-findings-{i}.md").write_text(
                 "# Blocking findings the builder could not close\n\n" + "\n".join(f"- {f}" for f in findings))
             arch = self._agent(run, "architect", "architect",
@@ -660,7 +660,7 @@ class Lane:
                         *findings,
                     ]
                     continue
-                return self._unresolved(run)
+                return self._unresolved(run, findings)
             # Record any surfaced decision as a PENDING SIGN-OFF — do not treat it as a blocker here.
             # Whether it truly blocks is decided by the reviewer below: if the build (with the seam +
             # build seed the architect installed) passes review, the decision is a non-blocking
@@ -702,17 +702,35 @@ class Lane:
         # continues. Only what the PM itself judges owner-level (pricing, legal, business model,
         # risk posture) reaches a human. Without this the PM was configured, prompted, granted
         # canon/** — and never once invoked, so every decision went straight to the owner.
-        return self._unresolved(run)
+        return self._unresolved(run, findings)
 
-    def _unresolved(self, run) -> bool:
+    def _unresolved(self, run, findings=None) -> bool:
         """The single exit for "the architect could not close it". EVERY such exit comes through
         here, so a decision cannot reach the owner without the PM having seen it first — the early
-        return on a failed architect round used to skip the triage entirely."""
+        return on a failed architect round used to skip the triage entirely.
+
+        TWO DIFFERENT THINGS EXIT HERE and they are not the same kind of failure:
+
+          · the architect surfaced a DECISION it may not make      -> a human ruling is the fix
+          · the architect could not CLOSE technical findings        -> more work is the fix
+
+        Only the first is the owner's. The second is unfinished engineering, and routing it upward
+        asks the owner to rule something no ruling can settle: "verified liquid assets are not read
+        through the mandated database reader" is not a question, it is a defect. JRN-B1 escalated
+        exactly that on 2026-08-21 — five implementation findings presented as though they needed a
+        decision. It is marked for REWORK instead, and only becomes the owner's if rework keeps
+        failing, which means something structural (a canon gap, or a journey too big to build in one
+        pass) and is then genuinely worth their attention."""
         if self._human_brief and self._pm_triage(run):
             ruling = run.dir / "pm-ruling.md"
             if self._converge(run, [ruling.read_text() if ruling.is_file() else "apply the PM ruling"], ""):
                 run.tracer.log(event_detail="pm_resolved")
                 return True
+        if not self._human_brief:
+            # Nothing to rule. This is work, not judgment.
+            run.tracer.log(event_detail="technical_unresolved", rounds=MAX_ARCH_ROUNDS,
+                           findings=list(findings or []))
+            return False
         run.tracer.log(event_detail="architect_not_resolved", rounds=MAX_ARCH_ROUNDS,
                        human_brief=self._human_brief or {})
         return False

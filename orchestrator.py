@@ -194,6 +194,8 @@ def dispatch(item, dry_run):
 
 
 DECISIONS = FACTORY_ROOT / "runs" / "decisions.yml"
+REWORK_DIR = FACTORY_ROOT / "runs" / "rework"
+MAX_REWORK = 2      # rework attempts before unclosed findings are genuinely the owner's
 
 
 def _queue_decision(item, run_id, blocking, human_brief=None):
@@ -321,11 +323,13 @@ def _verdict(target):
     """Read the latest run's TRUE finish for `target`: (accepted, merged, run_id, blocking,
     transient, cooldown_s).
     `merged` distinguishes a real acceptance from a build that was accepted but lost the merge race
-    on a moving base (I11) — the latter is re-queued, not escalated."""
+    on a moving base (I11) — the latter is re-queued, not escalated. `rework` carries findings the
+    architect could not close: unfinished engineering, which is re-dispatched as remediation rather
+    than escalated, because no ruling can settle a defect."""
     import json
     run = _latest_run(target)
     if not run:
-        return False, False, None, ["run produced no verdict"], False, 0.0, None, {}, None
+        return False, False, None, ["run produced no verdict"], False, 0.0, None, {}, None, []
     run_id = run["run_id"]
     conn = obsdb.connect()
     try:
@@ -333,6 +337,7 @@ def _verdict(target):
     finally:
         conn.close()
     accepted = merged = transient = False
+    rework: list[str] = []
     cooldown = 0.0
     cost = None
     brief = {}
@@ -352,11 +357,14 @@ def _verdict(target):
         elif ed == "agent_no_envelope":
             transient = True                       # an agent produced no output — infra/model failure
             cooldown = max(cooldown, float(d.get("retry_after_s") or 0.0))
+        elif ed == "technical_unresolved":
+            # Findings the architect could not close. Work, not a ruling — see Lane._unresolved.
+            rework = list(d.get("findings") or [])
         elif ed == "run_aborted_unavailable":
             transient = True                       # the lane stopped itself: undecidable, not a ruling
             cooldown = max(cooldown, float(d.get("retry_after_s") or 0.0))
     blocking = [] if accepted else _blocking(run_id)
-    return accepted, merged, run_id, blocking, transient, cooldown, cost, brief, pushed
+    return accepted, merged, run_id, blocking, transient, cooldown, cost, brief, pushed, rework
 
 
 def _target_of(item):
@@ -453,6 +461,7 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
     inflight: dict[str, tuple] = {}                    # item_id -> (live subprocess, its bindings)
     merge_retries: dict[str, int] = {}
     infra_retries: dict[str, int] = {}                 # transient (model overloaded / no envelope) retries
+    rework_retries: dict[str, int] = {}                # unclosed technical findings -> remediation retries
     judge = JudgeGate()                                # preflight: is the reviewer family up?
     migration_claims: dict[str, str] = {}              # item_id -> reserved migration number
     cycle_failures = 0                                 # consecutive cycles that raised
@@ -487,7 +496,7 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
                 item = by_id.get(iid)
                 if not item:
                     continue
-                accepted, merged, run_id, blocking, transient, cooldown, cost, brief, pushed = _verdict(_target_of(item))
+                accepted, merged, run_id, blocking, transient, cooldown, cost, brief, pushed, rework = _verdict(_target_of(item))
                 item["paid_usd"] = cost; pending.setdefault(iid, {})["paid_usd"] = cost
                 price = "" if cost is None else f"  (${cost:.2f} paid)"
                 item["run_id"] = run_id; pending.setdefault(iid, {})["run_id"] = run_id
@@ -529,6 +538,37 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
                                       f"is healthy. Run: {run_id}"),
                                 facet="product")
                         print(f"  ⏸ infra-hold {iid}  (infra x{n} — reopens when providers recover)", flush=True)
+                elif (not accepted) and rework:              # the architect could not CLOSE it
+                    # Unfinished engineering, not a ruling. Sending a defect to the owner asks them
+                    # to decide something no decision can settle; JRN-B1 did exactly that with five
+                    # implementation findings on 2026-08-21. Re-dispatch as remediation, carrying
+                    # the findings, and only escalate once rework itself keeps failing -- which
+                    # means something structural (a canon gap, or a journey too large for one pass)
+                    # and IS worth the owner's attention.
+                    n = rework_retries.get(iid, 0) + 1; rework_retries[iid] = n
+                    if n <= MAX_REWORK:
+                        fpath = REWORK_DIR / f"{iid}-{n}.md"
+                        REWORK_DIR.mkdir(parents=True, exist_ok=True)
+                        fpath.write_text("# Findings the architect could not close\n\n"
+                                         + "\n".join(f"- {f}" for f in rework) + "\n")
+                        item["status"] = "ready"; pending[iid] = {"status": "ready"}
+                        item["kind"] = "remediation"
+                        item["findings"] = str(fpath.relative_to(FACTORY_ROOT))
+                        item.setdefault("journey", _target_of(item))
+                        pending[iid].update({"kind": "remediation",
+                                             "findings": item["findings"],
+                                             "journey": item["journey"]})
+                        print(f"  ↻ rework    {iid}  ({len(rework)} unclosed finding(s), attempt {n}/{MAX_REWORK})",
+                              flush=True)
+                    else:
+                        item["status"] = "escalated"; pending[iid] = {"status": "escalated"}
+                        escalate(item, run_id,
+                                 [f"rework failed {n}x — the factory cannot close these findings on its "
+                                  f"own. This is likely a canon gap or a journey too large to build in "
+                                  f"one pass, and needs decomposition or a ruling.", *rework])
+                        nt.escalation(project=item.get("repo", "—"), item_id=iid, kind=item["kind"],
+                                      note=item.get("note", ""), run_id=run_id, blocking=rework)
+                        print(f"  ⚑ escalated {iid}  (rework x{n} — structural, needs you)", flush=True)
                 elif accepted and not merged:                # lost the merge race on a moving base (I11)
                     conflicts += 1                           # decomposition-gate feedback signal
                     n = merge_retries.get(iid, 0) + 1; merge_retries[iid] = n
