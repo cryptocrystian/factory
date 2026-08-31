@@ -135,6 +135,100 @@ def phase_stream(run_id: str, role: str, seq: int) -> dict | None:
 
 
 # ----------------------------------------------------------------------------- decisions
+
+FACTORY_ROOT = Path(__file__).resolve().parent
+BACKLOG = FACTORY_ROOT / "backlog.yml"
+
+
+def factory_state():
+    """Everything the landing view needs, in ONE call: what is building, what is queued behind
+    what, what needs a ruling, and how much provider headroom is left.
+
+    The dashboard previously opened on "select a run to inspect" — a list with nothing selected,
+    which shows the operator nothing about the factory as a whole. What matters at a glance is
+    concurrency (are the lanes full?), the queue (what is blocked, on what?), and the decisions
+    (what is waiting on me?)."""
+    import yaml
+    out = {"lanes": [], "queue": [], "decisions": [], "quota": [], "counts": {}}
+
+    # A run killed mid-flight (daemon restart) never gets finished_at, so "no finish time" alone
+    # would mark every abandoned run as live forever — 14 lanes on a 3-lane factory. Live means:
+    # unfinished, AND the newest run for its target, AND the backlog still says that item is
+    # in_progress. The backlog is the authority on what the daemon is actually running.
+    import yaml as _yaml
+    try:
+        _bl = _yaml.safe_load(BACKLOG.read_text()) or {}
+        _running = {i["id"].lower() for i in _bl.get("items", []) if i.get("status") == "in_progress"}
+    except Exception:
+        _running = set()
+
+    conn = obsdb.connect()
+    try:
+        rows = obsdb.list_runs(conn, limit=60) if hasattr(obsdb, "list_runs") else []
+        seen_targets = set()
+        for r in rows:                                  # newest first
+            if r.get("finished_at"):
+                continue
+            tgt = (r.get("target") or "").lower()
+            if tgt not in _running or tgt in seen_targets:
+                continue
+            seen_targets.add(tgt)
+            detail = obsdb.get_run(conn, r["run_id"])
+            if not detail:
+                continue
+            st = structure_run(detail)          # same shape the run-detail route serves
+            out["lanes"].append({
+                "run_id": r["run_id"], "target": r.get("target"),
+                "started_at": r.get("started_at"),
+                "cost_usd": st.get("cost_usd"),
+                "timeline": st.get("timeline") or [],
+            })
+    finally:
+        conn.close()
+
+    try:
+        bl = yaml.safe_load(BACKLOG.read_text()) or {}
+        items = bl.get("items", [])
+        done = {i["id"] for i in items if i.get("status") in ("accepted", "superseded")}
+        building = {l["target"].lower() for l in out["lanes"] if l.get("target")}
+        for i in items:
+            st = i.get("status")
+            if st in ("accepted", "superseded"):
+                continue
+            unmet = [d for d in (i.get("depends_on") or []) if d not in done]
+            out["queue"].append({
+                "id": i["id"], "status": st, "note": i.get("note", ""),
+                "waiting_on": unmet,
+                "building": i["id"].lower() in building,
+            })
+        out["counts"] = {
+            "building": len(out["lanes"]),
+            "ready": sum(1 for q in out["queue"] if q["status"] == "ready" and not q["waiting_on"]),
+            "blocked": sum(1 for q in out["queue"] if q["waiting_on"]),
+            "escalated": sum(1 for q in out["queue"] if q["status"] == "escalated"),
+            "done": len(done),
+            "total": len(items),
+        }
+    except Exception as ex:
+        out["queue_error"] = str(ex)
+
+    try:
+        d = load_decisions()
+        out["decisions"] = [x for x in (d.get("decisions") or []) if x.get("status") == "open"]
+    except Exception:
+        pass
+
+    try:
+        sys.path.insert(0, str(FACTORY_ROOT / "control-plane"))
+        import quota
+        out["quota"] = [{"provider": m.provider, "label": m.label,
+                         "used": round(m.used_fraction, 4), "exhausted": m.exhausted}
+                        for m in quota.snapshot()]
+    except Exception:
+        pass
+    return out
+
+
 def load_decisions():
     if not DECISIONS.exists():
         return {"decisions": []}
@@ -258,6 +352,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"runs": obsdb.list_runs(conn)})
                 finally:
                     conn.close()
+            if path == "/api/factory":
+                return self._json(factory_state(), 200)
             if path == "/api/decisions":
                 data = load_decisions()
                 pending = [d for d in data["decisions"] if d.get("status") == "pending"]
@@ -318,7 +414,7 @@ def main(argv):
 
 # ----------------------------------------------------------------------------- the dashboard
 SPA = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Factory · Observatory</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Factory · Observatory</title><link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Crect width=%2716%27 height=%2716%27 rx=%273%27 fill=%27%2312161c%27/%3E%3Crect x=%272.5%27 y=%274%27 width=%277%27 height=%272%27 rx=%271%27 fill=%27%236ea8d8%27/%3E%3Crect x=%272.5%27 y=%277%27 width=%2711%27 height=%272%27 rx=%271%27 fill=%27%235bb07f%27/%3E%3Crect x=%272.5%27 y=%2710%27 width=%275%27 height=%272%27 rx=%271%27 fill=%27%23e7a94b%27/%3E%3C/svg%3E">
 <style>
 :root{--ink:#12161c;--surf:#1b212a;--surf2:#20272f;--line:#2b333f;--fg:#e8ecf2;--dim:#9aa6b4;--mute:#6b7686;
 --accent:#e7a94b;--accent-ink:#1a140a;--pass:#5bb07f;--fail:#e0655c;--wait:#e7a94b;--info:#6ea8d8;
@@ -467,6 +563,74 @@ display:flex;align-items:center;gap:10px;margin:6px 0 2px}
 .cfg .row b{color:var(--fg)}
 .cfg pre{margin:8px 0 0;max-height:220px;overflow:auto;font-size:11px;line-height:1.45;
   background:var(--bg);padding:8px;border-radius:4px;border:1px solid var(--brd);white-space:pre-wrap}
+
+/* --- Factory view: the landing. Concurrency, queue, and what needs a human, on one screen. ----
+   Deliberately NOT a card grid. Each band is a different question ("what is running?", "what is
+   waiting on me?", "what is blocked on what?"), so each gets a different shape rather than the
+   same rounded box repeated -- uniform emphasis is the tell of a generated layout. */
+.fv{padding:16px 20px 40px;max-width:1500px;margin:0 auto}
+.fbar{display:flex;gap:0;align-items:stretch;border:1px solid var(--brd);border-radius:6px;
+  overflow:hidden;margin-bottom:22px;background:var(--panel)}
+.fstat{flex:1;padding:11px 16px;border-right:1px solid var(--brd)}
+.fstat:last-child{border-right:0}
+.fstat b{display:block;font-size:22px;line-height:1.1;color:var(--fg);font-variant-numeric:tabular-nums}
+.fstat span{font-family:var(--mono);font-size:9.5px;letter-spacing:.11em;text-transform:uppercase;color:var(--dim)}
+.fstat.alert b{color:var(--accent)}
+.fstat.alert span{color:var(--accent)}
+.fsec{margin:0 0 26px}
+.fsec>h3{font-family:var(--mono);font-size:10px;letter-spacing:.16em;text-transform:uppercase;
+  color:var(--dim);margin:0 0 10px;font-weight:600}
+.fsec>h3 i{font-style:normal;color:var(--mute)}
+/* swim lanes */
+.swim{display:flex;flex-direction:column;gap:7px}
+.slane{display:grid;grid-template-columns:92px 1fr 118px;align-items:center;gap:12px}
+.sname{font-family:var(--mono);font-size:12px;color:var(--fg);font-weight:600;text-align:right;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}
+.sname:hover{color:var(--accent)}
+.strack{position:relative;height:30px;background:var(--bg);border:1px solid var(--brd);border-radius:4px;overflow:hidden}
+.sblk{position:absolute;top:0;height:100%;display:flex;align-items:center;padding:0 7px;
+  font-size:10px;font-weight:600;white-space:nowrap;overflow:hidden;border-right:1px solid rgba(0,0,0,.35);
+  color:#0d1117;cursor:pointer}
+.sblk:hover{filter:brightness(1.2)}
+.sblk.running{animation:livepulse 1.8s ease-in-out infinite}
+@keyframes livepulse{0%,100%{opacity:1}50%{opacity:.62}}
+.sblk.failed{background:var(--bad)!important;color:#fff}
+.smeta{font-family:var(--mono);font-size:11px;color:var(--dim);text-align:right;font-variant-numeric:tabular-nums}
+.smeta b{color:var(--fg);font-weight:600}
+.slegend{display:flex;gap:14px;flex-wrap:wrap;margin-top:12px;padding-left:104px}
+.slegend span{font-family:var(--mono);font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--dim);
+  display:flex;align-items:center;gap:5px}
+.slegend i{width:9px;height:9px;border-radius:2px;display:inline-block}
+/* needs-you band: the one thing that must not look like everything else */
+.fdec{border-left:3px solid var(--accent);background:color-mix(in srgb,var(--accent) 8%,transparent);
+  padding:14px 18px;border-radius:0 6px 6px 0;margin-bottom:10px}
+.fdec .q{font-size:15px;color:var(--fg);margin:0 0 8px;line-height:1.45}
+.fdec .w{font-size:12.5px;color:var(--txt-dim,var(--dim));margin:0 0 12px;line-height:1.5}
+.fdec .opts{display:flex;flex-direction:column;gap:6px;margin-bottom:12px}
+.fdec .opt{display:flex;gap:9px;align-items:flex-start;font-size:12.5px;color:var(--dim);line-height:1.45}
+.fdec .opt b{color:var(--accent);font-family:var(--mono);font-size:11px;flex:none;padding-top:1px}
+.fdec .acts{display:flex;gap:7px;flex-wrap:wrap}
+.fbtn{font-family:var(--mono);font-size:11.5px;padding:7px 13px;border-radius:4px;cursor:pointer;
+  border:1px solid var(--brd);background:var(--surf);color:var(--txt,var(--fg))}
+.fbtn.go{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
+.fbtn:hover{filter:brightness(1.15)}
+/* queue: a dependency list, not boxes */
+.fq{display:flex;flex-direction:column}
+.fqrow{display:grid;grid-template-columns:96px 84px 1fr;gap:12px;align-items:baseline;
+  padding:6px 0;border-bottom:1px solid var(--brd);font-size:12.5px}
+.fqrow:last-child{border-bottom:0}
+.fqid{font-family:var(--mono);font-size:11.5px;color:var(--fg)}
+.fqst{font-family:var(--mono);font-size:9.5px;letter-spacing:.08em;text-transform:uppercase}
+.fqst.building{color:var(--ok)}
+.fqst.blocked{color:var(--mute)}
+.fqst.escalated{color:var(--accent)}
+.fqst.ready{color:var(--info,var(--dim))}
+.fqw{color:var(--dim)}
+.fqw b{color:var(--fg);font-family:var(--mono);font-size:11px}
+.fquota{display:flex;gap:16px;flex-wrap:wrap}
+.fquota div{font-family:var(--mono);font-size:11px;color:var(--dim)}
+.fquota b{color:var(--fg)}
+.fquota .x{color:var(--bad)}
 </style></head><body>
 <header>
   <span class="brand">Factory · Observatory</span>
@@ -474,7 +638,8 @@ display:flex;align-items:center;gap:10px;margin:6px 0 2px}
   <span class="sub" id="count">—</span>
   <span class="live"><span class="pulse"></span> live · polling 2s</span>
 </header>
-<div class="layout" id="runsview">
+<div class="fv-wrap" id="factoryview"></div>
+<div class="layout" id="runsview" style="display:none">
   <div class="list" id="list"></div>
   <div class="detail" id="detail"><div class="empty">Select a run to inspect its pipeline — then click any agent phase to drill in.</div></div>
 </div>
@@ -656,7 +821,7 @@ function loadDetail(id){
             :renderTimeline(run.timeline));
   });
 }
-let curRunId=null, mode="runs", pending=0;
+let curRunId=null, mode="factory", pending=0;
 // -- drill-down drawer: what an agent actually said and did in one phase --
 function openDrill(role,seq,label){
   if(!curRunId)return;
@@ -738,21 +903,165 @@ function pollDecisions(){return fetch("/api/decisions").then(r=>r.json()).then(d
   pending=d.pending||0; renderNav();
   if(mode==="decisions")renderDecisions(d.decisions||[]);
 }).catch(()=>{})}
+
+const ROLECOLOR={planner:"#6ea8d8",builder:"#5bb07f","test-author":"#c8a2e0",reviewer:"#e7a94b",
+  architect:"#e0655c","product-manager":"#4fbfa8",canon:"#6b7686",code:"#6b7686"};
+function roleColor(o){return ROLECOLOR[o]||"#6b7686"}
+function dur(a,b){const s=Math.max(0,(b-a));if(s<90)return Math.round(s)+"s";
+  const m=s/60;return m<90?Math.round(m)+"m":(m/60).toFixed(1)+"h"}
+
+function renderFactory(f){
+  const box=$("#factoryview");box.innerHTML="";
+  const wrap=el("div","fv");
+  const c=f.counts||{};
+
+  const bar=el("div","fbar");
+  [["building",c.building,0],["ready",c.ready,0],["blocked",c.blocked,0],
+   ["needs you",(f.decisions||[]).length,1],["shipped",(c.done||0)+"/"+(c.total||0),0]
+  ].forEach(([lbl,v,alert])=>{
+    const d=el("div","fstat"+(alert&&v?" alert":""));
+    d.append(el("b",null,String(v==null?"-":v)),el("span",null,lbl));bar.append(d);
+  });
+  wrap.append(bar);
+
+  // ---- swim lanes -------------------------------------------------------------------------
+  const lanes=f.lanes||[];
+  const s1=el("div","fsec");
+  s1.append(el("h3",null,"In flight <i>&middot; live, shared time axis</i>"));
+  if(!lanes.length){s1.append(el("div","empty","Nothing building. The daemon dispatches ready items on its next poll."))}
+  else{
+    const now=Date.now()/1000;
+    let t0=Math.min(...lanes.map(l=>l.started_at||now));
+    const span=Math.max(60,now-t0);
+    const swim=el("div","swim");
+    const used=new Set();
+    lanes.forEach(l=>{
+      const row=el("div","slane");
+      const nm=el("div","sname",l.target||l.run_id);
+      nm.onclick=()=>{mode="runs";sel=l.run_id;switchMode();loadDetail(l.run_id)};
+      const tr=el("div","strack");
+      let cost=0;
+      (l.timeline||[]).forEach(ev=>{
+        if(ev.type!=="phase")return;
+        const st=ev.ts, en=ev.ts_end||now;
+        const left=((st-t0)/span)*100, w=Math.max(0.9,((en-st)/span)*100);
+        const b=el("div","sblk"+(ev.status==="running"?" running":"")+(ev.status==="failed"?" failed":""));
+        b.style.left=left+"%";b.style.width=w+"%";
+        if(ev.status!=="failed")b.style.background=roleColor(ev.owner);
+        used.add(ev.owner);
+        (ev.items||[]).forEach(it=>{cost+=(it.cost||0)});
+        b.title=ev.name+" ("+ev.owner+") "+dur(st,en)+(ev.status?" - "+ev.status:"");
+        if(w>7)b.append(document.createTextNode(ev.name));
+        tr.append(b);
+      });
+      const meta=el("div","smeta");
+      meta.innerHTML="<b>"+dur(l.started_at||now,now)+"</b> &middot; $"+cost.toFixed(2);
+      row.append(nm,tr,meta);swim.append(row);
+    });
+    s1.append(swim);
+    const lg=el("div","slegend");
+    [...used].filter(Boolean).forEach(o=>{
+      const sp=el("span");const i=el("i");i.style.background=roleColor(o);sp.append(i,document.createTextNode(o));lg.append(sp);
+    });
+    s1.append(lg);
+  }
+  wrap.append(s1);
+
+  // ---- needs you --------------------------------------------------------------------------
+  const ds=f.decisions||[];
+  if(ds.length){
+    const s2=el("div","fsec");
+    s2.append(el("h3",null,"Needs you <i>&middot; "+ds.length+" waiting</i>"));
+    ds.forEach(d=>{
+      const card=el("div","fdec");
+      card.append(el("p","q",d.finding||"(no question recorded)"));
+      if(d.why)card.append(el("p","w",d.why));
+      const opts=d.options||[];
+      if(opts.length){
+        const ob=el("div","opts");
+        opts.forEach((o,i)=>{const r=el("div","opt");r.append(el("b",null,String(i+1)),el("span",null,o));ob.append(r)});
+        card.append(ob);
+      }
+      const acts=el("div","acts");
+      opts.forEach((o,i)=>{
+        const b=el("button","fbtn"+(i===0?" go":""),"Approve "+(i+1));
+        b.onclick=()=>{if(!confirm("Approve option "+(i+1)+"?\n\n"+o))return;
+          fetch("/api/decisions/"+encodeURIComponent(d.id),{method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({action:"approve option "+(i+1),note:o})}).then(()=>pollFactory())};
+        acts.append(b);
+      });
+      const rj=el("button","fbtn","Reject");
+      rj.onclick=()=>{const n=prompt("Why reject?");if(n==null)return;
+        fetch("/api/decisions/"+encodeURIComponent(d.id),{method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({action:"reject",note:n})}).then(()=>pollFactory())};
+      acts.append(rj);
+      card.append(acts);
+      s2.append(card);
+    });
+    wrap.append(s2);
+  }
+
+  // ---- queue ------------------------------------------------------------------------------
+  const q=(f.queue||[]).filter(x=>x.status!=="accepted");
+  if(q.length){
+    const s3=el("div","fsec");
+    s3.append(el("h3",null,"Queue <i>&middot; what is waiting, and on what</i>"));
+    const list=el("div","fq");
+    q.forEach(x=>{
+      const r=el("div","fqrow");
+      const st=x.building?"building":x.status;
+      r.append(el("div","fqid",x.id),el("div","fqst "+st,st));
+      const w=el("div","fqw");
+      w.innerHTML=x.waiting_on&&x.waiting_on.length
+        ? "waiting on <b>"+x.waiting_on.join("</b>, <b>")+"</b>"
+        : (x.note?String(x.note).slice(0,110):"");
+      r.append(w);list.append(r);
+    });
+    s3.append(list);wrap.append(s3);
+  }
+
+  // ---- provider headroom -------------------------------------------------------------------
+  const qa=f.quota||[];
+  if(qa.length){
+    const s4=el("div","fsec");
+    s4.append(el("h3",null,"Provider headroom"));
+    const g=el("div","fquota");
+    qa.forEach(m=>{
+      const d=el("div");
+      d.innerHTML=m.provider+" &middot; "+m.label+" <b class='"+(m.exhausted?"x":"")+"'>"
+        +Math.round(m.used*100)+"%</b>";
+      g.append(d);
+    });
+    s4.append(g);wrap.append(s4);
+  }
+
+  box.append(wrap);
+}
+function pollFactory(){return fetch("/api/factory").then(r=>r.json()).then(f=>{
+  factoryState=f; pending=(f.decisions||[]).length;
+  if(mode==="factory")renderFactory(f); renderNav();
+}).catch(()=>{})}
+
 function renderNav(){
   const n=$("#nav");n.innerHTML="";
-  [["runs","Runs"],["decisions","Decisions"]].forEach(([m,lbl])=>{
+  [["factory","Factory"],["runs","Runs"],["decisions","Decisions"]].forEach(([m,lbl])=>{
     const b=el("button",mode===m?"on":null);b.append(document.createTextNode(lbl));
     if(m==="decisions"&&pending)b.append(el("span","badge",String(pending)));
     b.onclick=()=>{mode=m;switchMode()};n.append(b);
   });
 }
 function switchMode(){
+  $("#factoryview").style.display = mode==="factory"?"block":"none";
   $("#runsview").style.display = mode==="runs"?"grid":"none";
   $("#decisionsview").style.display = mode==="decisions"?"block":"none";
-  renderNav(); if(mode==="decisions")pollDecisions();
+  renderNav(); if(mode==="decisions")pollDecisions(); if(mode==="factory")pollFactory();
 }
 function poll(){fetch("/api/runs").then(r=>r.json()).then(d=>{runs=d.runs||[];renderList();if(sel&&mode==="runs")loadDetail(sel)}).catch(()=>{})}
-renderNav();poll();pollDecisions();setInterval(()=>{poll();pollDecisions()},2000);
+let factoryState={};
+renderNav();switchMode();poll();pollDecisions();pollFactory();
+setInterval(()=>{poll();pollDecisions();pollFactory()},2000);
 </script></body></html>"""
 
 
