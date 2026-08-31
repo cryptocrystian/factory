@@ -582,6 +582,86 @@ def verify_orchestration_table_stakes() -> None:
           "ahead and behind are both refused, for different reasons")
 
 
+
+def verify_classification() -> None:
+    """Every bug this pipeline has produced has been ONE bug wearing different clothes: two things
+    that look alike, told apart by code that nothing tested.
+
+      infra failure vs code finding · provider outage vs decision · launch gate vs build gate ·
+      subscription vs metered route · the factory's own post vs an inbound command ·
+      an opening tag vs a nested one
+
+    Each was found by hand, one shipped defect at a time, because no test pinned the boundary. This
+    section pins them — BOTH SIDES of each, since a classifier that only ever says "no" passes a
+    one-sided test while being useless. Adding a new classification to the pipeline means adding its
+    pair here."""
+    sys.path.insert(0, str(ROOT / "control-plane"))
+    import config, omp, orchestrator, buzz_rulings
+    import dataclasses
+
+    # --- infra failure vs behaviour ------------------------------------------------------------
+    def result(**kw):
+        base = dict(envelope=None, ok=False, session_id=None, cost_usd=0.0, timed_out=False,
+                    events=3, raw_final="", error="", provider_error="", retry_after_s=0.0)
+        base.update(kw)
+        return omp.AgentResult(**{k: v for k, v in base.items()
+                                  if k in {f.name for f in dataclasses.fields(omp.AgentResult)}})
+
+    check(result(provider_error="rate_limit_exceeded", raw_final="").infra_failed,
+          "a provider error with no answer at all is INFRA")
+    check(not result(provider_error="rate_limit_exceeded",
+                     raw_final='{"status":"success"').infra_failed,
+          "an absorbed provider error that still produced a final message is BEHAVIOUR, not infra",
+          "re-prompt the session; do not park the item")
+    check(not result(provider_error="", raw_final="").infra_failed,
+          "no envelope and no provider error is NOT infra")
+
+    # --- subscription vs metered vs paid -------------------------------------------------------
+    check(not config.is_paid_route("anthropic/claude-opus-5")
+          and not config.is_metered_subscription("anthropic/claude-opus-5"),
+          "a plain subscription route is free and unmetered")
+    check(not config.is_paid_route("anthropic/claude-fable-5")
+          and config.is_metered_subscription("anthropic/claude-fable-5"),
+          "a metered-subscription route is inside the plan but separately capped")
+    check(config.is_paid_route("openrouter/openai/gpt-5.6-sol")
+          and not config.is_metered_subscription("openrouter/openai/gpt-5.6-sol"),
+          "a metered API route is paid")
+    # the guard that keeps a metered model off a per-cycle role, proved in both directions
+    saved = dict(config.ROLES)
+    try:
+        config.ROLES["builder"] = dataclasses.replace(config.ROLES["builder"], model="claude-fable-5")
+        try:
+            config.validate_roles(["builder"]); raised = False
+        except ValueError:
+            raised = True
+        check(raised, "a metered model is refused on a per-cycle role")
+        config.ROLES["architect"] = dataclasses.replace(config.ROLES["architect"], model="claude-fable-5")
+        try:
+            config.validate_roles(["architect"]); ok_low = True
+        except ValueError:
+            ok_low = False
+        check(ok_low, "a metered model is permitted on a low-volume judgment role")
+    finally:
+        config.ROLES.clear(); config.ROLES.update(saved)
+
+    # --- a provider outage is not a verdict ----------------------------------------------------
+    items = [{"id": "held", "status": "infra_hold", "kind": "journey", "depends_on": []},
+             {"id": "ruled", "status": "escalated", "kind": "journey", "depends_on": []},
+             {"id": "open", "status": "ready", "kind": "journey", "depends_on": []}]
+    dispatchable = {i["id"] for i in orchestrator.ready(items)}
+    check("held" in dispatchable,
+          "an infrastructure hold reopens itself", "a provider outage must not need a human to clear")
+    check("ruled" not in dispatchable,
+          "a real escalation still waits on the owner")
+
+    # --- the factory's own voice vs an inbound command -----------------------------------------
+    check(buzz_rulings.looks_like_factory_post("⚑ ESCALATION — jrn-b1\nproject: arxus"),
+          "the factory recognises its own escalation post")
+    check(not buzz_rulings.looks_like_factory_post("RULE jrn-b1: approve option 1"),
+          "an owner ruling is not mistaken for the factory's own post")
+
+
+
 def verify_rollback_safety() -> None:
     """A rollback must never be worse than the breach it undoes. `git status --porcelain` reports an
     untracked DIRECTORY as one entry ("?? app/"), and unlink() on a directory raised
@@ -773,6 +853,7 @@ def main(argv: list[str]) -> int:
     verify_phase_intent()
     verify_loop_governance()
     verify_escalation_payload()
+    verify_classification()
     verify_rollback_safety()
     verify_acceptance_ledger()
     verify_no_self_ruling()
