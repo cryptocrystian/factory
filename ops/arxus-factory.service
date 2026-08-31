@@ -21,7 +21,7 @@ Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/r
 #
 # Parallelism is not free here; it is borrowed from the production workload. Raise N only on the
 # worker tier (exe.dev), where a lane gets its own machine.
-ExecStart=/root/.local/bin/uv run orchestrator.py --daemon --max-parallel 1 --poll 20
+ExecStart=/root/.local/bin/uv run orchestrator.py --daemon --max-parallel 3 --poll 20
 Restart=always
 RestartSec=10
 
@@ -32,11 +32,11 @@ RestartSec=10
 #   CPUWeight   20 — under contention, production wins (default is 100)
 #   Nice        10 — deprioritised against interactive and container work
 #   IOWeight    50 — worktree churn must not starve Postgres I/O
-CPUQuota=120%
+CPUQuota=150%
 CPUWeight=20
 Nice=10
 IOWeight=50
-MemoryMax=3G
+MemoryMax=5G
 # Kill the whole cgroup on stop/restart so in-flight journey subprocesses are reaped (no orphans).
 KillMode=control-group
 TimeoutStopSec=30
