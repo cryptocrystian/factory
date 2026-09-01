@@ -604,6 +604,15 @@ display:flex;align-items:center;gap:10px;margin:6px 0 2px}
 /* needs-you band: the one thing that must not look like everything else */
 .fdec{border-left:3px solid var(--accent);background:color-mix(in srgb,var(--accent) 8%,transparent);
   padding:14px 18px;border-radius:0 6px 6px 0;margin-bottom:10px}
+
+.fdec .ruling{margin-top:12px;border-top:1px solid color-mix(in srgb,var(--accent) 24%,transparent);padding-top:12px}
+.fdec .ruling label{display:block;font-family:var(--mono);font-size:9.5px;letter-spacing:.11em;
+  text-transform:uppercase;color:var(--dim);margin-bottom:6px}
+.fdec textarea{width:100%;box-sizing:border-box;min-height:74px;resize:vertical;font-family:var(--mono);
+  font-size:12px;line-height:1.55;padding:9px 11px;border-radius:4px;border:1px solid var(--brd);
+  background:var(--bg);color:var(--fg)}
+.fdec textarea:focus{outline:none;border-color:var(--accent)}
+.fdec .ruling .acts{margin-top:9px}
 .fdec{user-select:text;-webkit-user-select:text}
 .fdec .q{font-size:15px;color:var(--fg);margin:0 0 8px;line-height:1.45}
 .fdec .w{font-size:12.5px;color:var(--txt-dim,var(--dim));margin:0 0 12px;line-height:1.5}
@@ -1037,6 +1046,38 @@ function renderFactory(f){
           body:JSON.stringify({action:"reject",note:n})}).then(()=>pollFactory())};
       acts.append(rj);
       card.append(acts);
+
+      // Free-text ruling. The option buttons cover the cases the factory anticipated; a real
+      // ruling often does not fit any of them (DEC-068 rewrote the question rather than picking
+      // an option). This posts the same endpoint with the full text as the note.
+      const rb=el("div","ruling");
+      const lab=el("label",null,"Or write the ruling");
+      const ta=document.createElement("textarea");
+      ta.placeholder="Paste or type the full ruling. Markdown is fine — it is stored verbatim and mirrored into canon.";
+      ta.value=rulingDrafts[d.id]||"";
+      ta.oninput=()=>{rulingDrafts[d.id]=ta.value};
+      const racts=el("div","acts");
+      const sub=el("button","fbtn go","Approve with this ruling");
+      sub.onclick=()=>{
+        const t=ta.value.trim();
+        if(!t){ta.focus();return}
+        fetch("/api/decisions/"+encodeURIComponent(d.id),{method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({action:"approve",note:t})})
+          .then(()=>{delete rulingDrafts[d.id];lastFactorySig="";pollFactory()});
+      };
+      const rej=el("button","fbtn","Reject with this reason");
+      rej.onclick=()=>{
+        const t=ta.value.trim();
+        if(!t){ta.focus();return}
+        fetch("/api/decisions/"+encodeURIComponent(d.id),{method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({action:"reject",note:t})})
+          .then(()=>{delete rulingDrafts[d.id];lastFactorySig="";pollFactory()});
+      };
+      racts.append(sub,rej);
+      rb.append(lab,ta,racts);
+      card.append(rb);
       s2.append(card);
     });
     wrap.append(s2);
@@ -1079,6 +1120,7 @@ function renderFactory(f){
   box.append(wrap);
 }
 let lastFactorySig="";
+const rulingDrafts={};   // decision id -> in-progress ruling text
 function selectionInside(node){
   const sel=window.getSelection();
   if(!sel||sel.isCollapsed||!sel.rangeCount)return false;
@@ -1094,6 +1136,11 @@ function pollFactory(){return fetch("/api/factory").then(r=>r.json()).then(f=>{
   const sig=JSON.stringify(f);
   if(sig===lastFactorySig)return;
   if(selectionInside($("#factoryview")))return;
+  // Never repaint out from under someone composing a ruling. Drafts also survive in
+  // rulingDrafts and are restored on render, so even a forced repaint cannot eat the text.
+  const ae=document.activeElement;
+  if(ae&&(ae.tagName==="TEXTAREA"||ae.tagName==="INPUT")&&$("#factoryview").contains(ae))return;
+  if(Object.values(rulingDrafts).some(v=>v&&v.trim()))return;
   lastFactorySig=sig; renderFactory(f);
 }).catch(()=>{})}
 
