@@ -340,6 +340,44 @@ class Lane:
         run.tracer.log(event_detail="run_cost", paid_usd=spend, accepted=bool(accepted),
                        journey=self.journey)
 
+
+    def resume(self, branch: str) -> bool:
+        """Re-judge an existing, unreviewed build instead of rebuilding it from base.
+
+        The expensive half of a journey is planning and building; the half that keeps dying is
+        review, because the judge families are the exhausted ones. Rebuilding from base to reach the
+        same reviewer is pure waste — and it is what happened 98 times. This starts from the prior
+        run's committed work and goes straight to test + review, so a provider outage costs the
+        review, not the build.
+
+        ONLY for work that was never judged (infra death, killed mid-flight). A build the reviewer
+        rejected must not come back through here — the fix loop owns that, against its findings."""
+        run = Run(self.repo, lane="feature", target=self.journey, resume_from=branch)
+        self._active["run"] = run
+        self._agent_gates_ok = True
+        self._human_brief = None
+        config.validate_roles(LANE_ROLES)
+        quota_before = quota.as_dict(quota.snapshot()) if self.live else {}
+        run.tracer.log(event_detail="resume_start", journey=self.journey, branch=branch)
+        try:
+            (run.dir / "context.md").write_text(CanonResolver(self.repo).resolve(self.journey).markdown())
+            unit_ok = self._test(run)                       # tests may be absent if it died before them
+            ledger_findings = self._ledger(run)
+            approved, findings, _ = self._review(run)
+            findings = ledger_findings + list(findings)
+            accepted = (unit_ok[0] and approved and self._agent_gates_ok and not ledger_findings)
+            if not accepted:
+                accepted = (self._architect_resolve(run) if needs_protected_path(findings)
+                            else self._converge(run, findings, unit_ok[1]))
+            if not accepted and self.live:
+                accepted = self._architect_resolve(run)
+            self._record_cost(run, accepted)
+            return run.finish(accepted, reason="" if accepted else self._escalation_reason())
+        except PhaseUnavailable as e:
+            return self._abort(run, e)
+        finally:
+            self._record_quota(run, quota_before)
+
     def remediate(self, findings: str) -> bool:
         """Close open review findings on an already-built journey, via the bounded fix loop."""
         run = Run(self.repo, lane="remediate", target=self.journey)
@@ -864,12 +902,15 @@ def main(argv):
     ap.add_argument("--replay", default="", help="recorded run dir to replay envelopes from")
     ap.add_argument("--remediate", default="", help="path to a findings file: run the fix->test->re-review loop")
     ap.add_argument("--foundation", default="", help="path to a brief file: build a foundation (not a canon journey)")
+    ap.add_argument("--resume", default="", help="work branch of an UNJUDGED prior run: re-judge it instead of rebuilding")
     a = ap.parse_args(argv)
     live = not a.replay
     runner = ReplayRunner(Path(a.replay)) if a.replay else LiveRunner()
     lane = Lane(Path(a.repo), a.journey, runner, live)
     _install_kill_recorder(lane._active)
-    if a.remediate:
+    if a.resume:
+        accepted = lane.resume(a.resume)
+    elif a.remediate:
         accepted = lane.remediate(Path(a.remediate).read_text())
     elif a.foundation:
         accepted = lane.foundation(Path(a.foundation).read_text())

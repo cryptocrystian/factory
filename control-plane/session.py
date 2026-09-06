@@ -21,7 +21,7 @@ class GitError(RuntimeError):
 
 class Run:
     def __init__(self, workspace: Path, lane: str, target: str, run_id: str | None = None,
-                 isolation_port=None):
+                 isolation_port=None, resume_from: str | None = None):
         self.origin = Path(workspace).resolve()                 # the real repo — never mutated by a run
         self.lane = lane
         self.target = target
@@ -33,13 +33,16 @@ class Run:
         # Isolation port: acquire an isolated worktree; the run mutates only there and merges back to the
         # base only when accepted (gated merge, Rev4 P5). The origin repo's working tree is never touched.
         self._iso_port = isolation_port or isolation.default_isolation()
-        self._iso = self._iso_port.acquire(self.origin, self.run_id)
+        self._iso = self._iso_port.acquire(self.origin, self.run_id, resume_from=resume_from) \
+            if resume_from else self._iso_port.acquire(self.origin, self.run_id)
+        self.resumed_from = resume_from
         self.workspace = self._iso.path                         # where the run (and its agents) operate
         self._base = self._iso.base_commit
         self.base_branch = self._iso.base_branch
         self.work_branch = self._iso.branch
         self.tracer.log(event_detail="run_start", origin=str(self.origin), workspace=str(self.workspace),
-                        base=self._base[:8], base_branch=self.base_branch, work_branch=self.work_branch)
+                        base=self._base[:8], base_branch=self.base_branch, work_branch=self.work_branch,
+                        resumed_from=resume_from)
 
     # ---- git in the workspace ------------------------------------------------
     def git(self, *args: str) -> str:

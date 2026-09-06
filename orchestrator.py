@@ -139,10 +139,52 @@ def claim_migration_number(item, held_claims) -> str:
     return f"{(max(used) + 1) if used else 1:04d}"
 
 
+
+# Reasons that mean the work was NEVER JUDGED. Only these may be resumed: a build the reviewer
+# rejected is tainted and belongs in the fix loop against its findings, not back on the bench.
+_UNJUDGED = ("unavailable (infra)", "provider failure", "killed mid-flight")
+
+
+def resumable_branch(item) -> str | None:
+    """The work branch of this target's most recent UNJUDGED run, if it still holds commits.
+
+    A run that dies on a provider outage leaves a finished build on its branch. Rebuilding it from
+    base to reach the same exhausted reviewer wastes the whole plan+build — which is how 98
+    abandoned branches accumulated, JRN-B1 alone rebuilt from scratch eight times. Resuming turns a
+    provider outage into the cost of a review rather than the cost of a journey."""
+    target = _target_of(item)
+    repo = Path(repo_path(item["repo"]))
+    conn = obsdb.connect()
+    try:
+        for r in obsdb.list_runs(conn, limit=120):
+            if (r.get("target") or "").lower() != target.lower():
+                continue
+            if r.get("accepted"):
+                return None                    # already landed; nothing to resume
+            reason = str(r.get("reason") or "")
+            if not any(k in reason.lower() for k in _UNJUDGED):
+                return None                    # newest outcome was a JUDGEMENT — do not resume it
+            branch = f"factory/{r['run_id']}"
+            try:
+                _git_out(repo, "rev-parse", "--verify", f"{branch}^{{commit}}")
+                ahead = _git_out(repo, "rev-list", "--count", f"main..{branch}").strip()
+            except Exception:
+                continue                       # branch pruned; look further back
+            if ahead.isdigit() and int(ahead) > 0:
+                return branch
+        return None
+    finally:
+        conn.close()
+
+
 def _cmd(item):
     repo = repo_path(item["repo"])
     if item["kind"] == "journey":
-        return ["uv", "run", LANE, "--repo", repo, "--journey", item["journey"]]
+        cmd = ["uv", "run", LANE, "--repo", repo, "--journey", item["journey"]]
+        rb = resumable_branch(item)
+        if rb:
+            cmd += ["--resume", rb]
+        return cmd
     if item["kind"] == "foundation":
         return ["uv", "run", LANE, "--repo", repo, "--journey", item["id"],
                 "--foundation", str(FACTORY_ROOT / item["brief"])]

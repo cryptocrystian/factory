@@ -659,6 +659,21 @@ def verify_classification() -> None:
     sys.path.insert(0, str(ROOT / "lanes"))
     import feature
 
+    # --- unjudged work vs judged work ----------------------------------------------------------
+    # Resuming is only safe for work no reviewer ever saw. A build the reviewer REJECTED is tainted
+    # and belongs in the fix loop against its findings; a build killed by a provider outage is
+    # merely unreviewed. Getting this backwards would re-present rejected code as if it were fresh.
+    import orchestrator as _orch
+    _judged = lambda r: any(k in r.lower() for k in _orch._UNJUDGED)
+    check(_judged("reviewer unavailable (infra): provider failure"),
+          "an infra death leaves work that MAY be resumed", "it was never judged")
+    check(_judged("killed mid-flight by signal 15 (daemon restart or stop)"),
+          "a killed run leaves work that MAY be resumed")
+    check(not _judged("did not converge (architect could not resolve technically)"),
+          "work the reviewer rejected is NOT resumable", "it belongs in the fix loop, against findings")
+    check(not _judged("decision needed: should Arxus remain seller-invited-only"),
+          "work parked on a decision is NOT resumable")
+
     # --- a killed run vs a failed run ----------------------------------------------------------
     # 23 runs finished with no verdict and no reason because SIGTERM (daemon restart) skipped
     # run.finish() entirely. Unaccounted work is invisible twice: absent from the history, and

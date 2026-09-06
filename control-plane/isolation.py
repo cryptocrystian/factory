@@ -75,7 +75,20 @@ class WorktreeIsolation:
         self.worktrees_dir = Path(worktrees_dir)
         self.shared_ignored = shared_ignored
 
-    def acquire(self, origin: Path, run_id: str) -> IsolatedWorkspace:
+    def acquire(self, origin: Path, run_id: str, resume_from: str | None = None) -> IsolatedWorkspace:
+        """`resume_from` starts the new work branch at an EXISTING branch instead of the base.
+
+        A run that dies on infrastructure or is killed mid-flight leaves a complete, committed build
+        on its work branch — 98 such branches exist here, several thousand lines each — and the next
+        dispatch threw all of it away and rebuilt from base. JRN-B1 was re-planned and re-built from
+        scratch eight times, dying at the reviewer every time, while its finished build sat on a
+        branch nothing ever looked at again.
+
+        Only unjudged work may be resumed. A build the reviewer REJECTED is tainted and must be
+        rebuilt or remediated against its findings; a build that was never reviewed is simply
+        unreviewed. The caller decides which case this is; this method only does what it is told.
+        The merge target is unchanged — resuming affects where the branch STARTS, never where it
+        lands."""
         origin = Path(origin).resolve()
         base_branch = _git(origin, "rev-parse", "--abbrev-ref", "HEAD").strip()
         base_commit = _git(origin, "rev-parse", "HEAD").strip()
@@ -86,7 +99,13 @@ class WorktreeIsolation:
         self.worktrees_dir.mkdir(parents=True, exist_ok=True)
         if wt.exists():
             raise GitError(f"worktree path already exists: {wt}")
-        _git(origin, "worktree", "add", "-q", "-b", branch, str(wt), base_commit)
+        start_at = base_commit
+        if resume_from:
+            try:
+                start_at = _git(origin, "rev-parse", "--verify", f"{resume_from}^{{commit}}").strip()
+            except Exception:
+                start_at = base_commit          # a missing branch must not stop the run, only un-resume it
+        _git(origin, "worktree", "add", "-q", "-b", branch, str(wt), start_at)
         symlinks: list[Path] = []
         for name in self.shared_ignored:
             src, dst = origin / name, wt / name
