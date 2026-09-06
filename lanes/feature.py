@@ -215,9 +215,13 @@ class Lane:
         self._review_cycles = 0            # total reviews this run — the ceiling over the nested loops
         self._run_started = time.monotonic()
         self._seen_findings: list[str] = []
+        # Shared with the SIGTERM recorder so a killed run can still be written down (see
+        # _install_kill_recorder). A dict, not an attribute, so the handler sees updates.
+        self._active: dict = {}
 
     def run(self) -> bool:
         run = Run(self.repo, lane="feature", target=self.journey)
+        self._active["run"] = run
         self._agent_gates_ok = True
         self._human_brief = None                 # set by the architect when it surfaces a decision
         config.validate_roles(LANE_ROLES)                 # hard rule 1: fail before anything spawns
@@ -822,6 +826,37 @@ class Lane:
                 "You may run the gates. Return your verdict envelope.")
 
 
+def _install_kill_recorder(lane_ref: dict) -> None:
+    """Record a run that is KILLED mid-flight instead of letting it vanish.
+
+    A lane terminated by SIGTERM (daemon restart, systemctl stop, deploy) never reaches
+    run.finish(), so it left no verdict, no reason and no finished_at. 23 of this factory's runs are
+    in that state, and they were invisible twice over: unaccounted in the run history, and counted
+    as still-live by the observatory, which is why it once reported 14 lanes on a 3-lane factory.
+
+    A killed run is not a failed run and must not read as one — it is work that was interrupted, and
+    the record has to say so, naming the phase it died in so the next dispatch starts informed."""
+    import signal
+
+    def _record(signum, _frame):
+        run = lane_ref.get("run")
+        if run is not None:
+            try:
+                run.tracer.log(event_detail="run_killed", signal=int(signum),
+                               phase=getattr(run, "_phase_name", None) or "unknown")
+                run.finish(False, reason=f"killed mid-flight by signal {int(signum)} "
+                                         f"(daemon restart or stop) — not a verdict on the work")
+            except Exception:
+                pass                     # a dying process must not raise on its way out
+        raise SystemExit(143)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _record)
+        except (ValueError, OSError):
+            pass                         # not the main thread, or platform without it
+
+
 def main(argv):
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", required=True)
@@ -833,6 +868,7 @@ def main(argv):
     live = not a.replay
     runner = ReplayRunner(Path(a.replay)) if a.replay else LiveRunner()
     lane = Lane(Path(a.repo), a.journey, runner, live)
+    _install_kill_recorder(lane._active)
     if a.remediate:
         accepted = lane.remediate(Path(a.remediate).read_text())
     elif a.foundation:

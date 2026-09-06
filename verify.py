@@ -659,6 +659,19 @@ def verify_classification() -> None:
     sys.path.insert(0, str(ROOT / "lanes"))
     import feature
 
+    # --- a killed run vs a failed run ----------------------------------------------------------
+    # 23 runs finished with no verdict and no reason because SIGTERM (daemon restart) skipped
+    # run.finish() entirely. Unaccounted work is invisible twice: absent from the history, and
+    # counted as still-live by the observatory.
+    import inspect as _inspect
+    src = _inspect.getsource(feature._install_kill_recorder)
+    check("run_killed" in src and "signal.SIGTERM" in src,
+          "a run killed mid-flight records run_killed, rather than vanishing")
+    check("not a verdict on the work" in src,
+          "a killed run is not recorded as a verdict on the work",
+          "an interrupted run must not read as a rejection")
+
+
     class _Tracer:
         def __init__(self): self.events = []
         def log(self, **kw): self.events.append(kw.get("event_detail"))

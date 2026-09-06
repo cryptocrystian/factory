@@ -76,6 +76,7 @@ class Run:
     @contextmanager
     def phase(self, params: E.PhaseParams):
         self.tracer.phase_start(params.name, params.kind, params.owner)
+        self._phase_name = params.name        # so a SIGTERM recorder can name where the run died
         ph = _Phase(self, params)
         status = "fail"                       # status defaults to failure; success is earned (I5)
         try:
