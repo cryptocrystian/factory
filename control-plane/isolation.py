@@ -144,7 +144,32 @@ class WorktreeIsolation:
             _git(ws.origin, "-c", "commit.gpgsign=false", "merge", "--no-ff", "-q",
                  "-m", f"merge {ws.branch} (accepted)", ws.branch)
         except GitError as e:
-            return MergeResult(merged=False, error=str(e))
+            # A CONFLICTED MERGE MUST NOT WEDGE THE ORIGIN. git leaves the repo mid-merge on
+            # conflict; returning without aborting leaves MERGE_HEAD and conflict markers in the
+            # working tree, and every subsequent run then dies on the I4 clean-tree check before
+            # recording a single event. JRN-G1's merge conflicted on 2026-09-08 and did exactly
+            # that: three weeks of dispatches crashed in Run.__init__, produced zero events, and
+            # were escalated to the owner as "did not reach acceptance" — a whole factory stopped
+            # by one unfinished merge.
+            #
+            # The work is never at risk: it is committed on the work branch, which is kept. Abort
+            # restores the origin to its pre-merge state so the next run can start, and the branch
+            # is re-dispatched or rebuilt against the new base.
+            try:
+                _git(ws.origin, "merge", "--abort")
+            except GitError:
+                try:                                  # older git, or a merge that never opened
+                    _git(ws.origin, "reset", "--merge")
+                except GitError:
+                    pass
+            residue = ""
+            try:
+                if _git(ws.origin, "status", "--porcelain").strip():
+                    residue = " AND THE ORIGIN IS STILL DIRTY — dispatch will block until cleaned"
+            except GitError:
+                pass
+            return MergeResult(merged=False,
+                               error=f"merge conflicted, aborted, origin restored{residue}: {e}")
         # PUSH. Without this the merge lands on the box's local branch and stops there: JRN-S4's
         # entire accepted build — ten commits, a migration, 3,800 lines — sat only on the VPS until
         # 2026-08-21, while the handoff claimed GitHub was the origin of truth. A merge nobody else

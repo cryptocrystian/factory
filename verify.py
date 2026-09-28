@@ -700,6 +700,37 @@ def verify_classification() -> None:
           "the preflight probes the BUILDER, not only the judge",
           "a healthy judge over a dead builder produces nothing")
 
+    # --- a conflicted merge must not wedge the origin -------------------------------------------
+    # The three-week outage. git leaves the repo mid-merge on conflict; returning without aborting
+    # left MERGE_HEAD and conflict markers in the origin, so every later run died on the I4
+    # clean-tree check before recording a single event.
+    import subprocess as _sp, tempfile as _tf
+    import isolation as _iso_mod
+
+    def _g(d, *a):
+        return _sp.run(["git", *a], cwd=str(d), capture_output=True, text=True).stdout
+
+    _tmp = Path(_tf.mkdtemp())
+    _o = _tmp / "origin"; _o.mkdir()
+    _g(_o, "init", "-q", "-b", "main"); _g(_o, "config", "user.email", "t@t"); _g(_o, "config", "user.name", "t")
+    (_o / "f.txt").write_text("base\n"); _g(_o, "add", "-A"); _g(_o, "commit", "-q", "-m", "base")
+    _iso = _iso_mod.WorktreeIsolation(_tmp / "wt")
+    _ws = _iso.acquire(_o, "conflictcheck")
+    (_ws.path / "f.txt").write_text("branch\n")
+    _ws.git("add", "-A"); _ws.git("-c", "commit.gpgsign=false", "commit", "-m", "b")
+    (_o / "f.txt").write_text("main\n"); _g(_o, "add", "-A"); _g(_o, "commit", "-q", "-m", "m")
+    _ws.base_commit = _g(_o, "rev-parse", "main").strip()      # satisfy I11 so the MERGE is reached
+    _res = _iso.merge_back(_ws, accepted=True)
+
+    check(not _res.merged, "a conflicted merge does not report success")
+    check(_g(_o, "status", "--porcelain").strip() == "",
+          "a conflicted merge leaves the origin CLEAN",
+          "otherwise every later run dies on the I4 clean-tree check")
+    check(not (_o / ".git" / "MERGE_HEAD").exists(),
+          "no MERGE_HEAD is left behind", "the repo is not parked mid-merge")
+    check(bool(_g(_o, "rev-parse", "--verify", _ws.branch).strip()),
+          "the work branch survives the abort", "aborting restores the origin, it loses no work")
+
     # --- no verdict vs a verdict ---------------------------------------------------------------
     # A run with zero events never reached a reviewer. There is no finding to rule, so it must not
     # become an escalation carrying the placeholder "did not reach acceptance".
