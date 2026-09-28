@@ -700,6 +700,14 @@ def verify_classification() -> None:
           "the preflight probes the BUILDER, not only the judge",
           "a healthy judge over a dead builder produces nothing")
 
+    # --- no verdict vs a verdict ---------------------------------------------------------------
+    # A run with zero events never reached a reviewer. There is no finding to rule, so it must not
+    # become an escalation carrying the placeholder "did not reach acceptance".
+    _src = _i.getsource(_orch._verdict)
+    check("NO VERDICT IS NOT A VERDICT" in _src and "transient = True" in _src,
+          "a run that recorded nothing is transient, not an escalation",
+          "zero events means no reviewer ran; there is nothing to rule")
+
     # --- unjudged work vs judged work ----------------------------------------------------------
     # Resuming is only safe for work no reviewer ever saw. A build the reviewer REJECTED is tainted
     # and belongs in the fix loop against its findings; a build killed by a provider outage is

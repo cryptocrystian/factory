@@ -405,6 +405,14 @@ def _verdict(target):
         elif ed == "run_aborted_unavailable":
             transient = True                       # the lane stopped itself: undecidable, not a ruling
             cooldown = max(cooldown, float(d.get("retry_after_s") or 0.0))
+    # NO VERDICT IS NOT A VERDICT. A run that recorded zero events never reached a reviewer, so
+    # there is no finding, no judgement and nothing a human can rule — escalating it puts the
+    # placeholder "did not reach acceptance" in front of the owner and parks every dependent behind
+    # a crash. jrn-b1, jrn-g1 and jrn-g2 sat that way for three weeks. Treat it as the infra failure
+    # it almost certainly is: retried with backoff, then a self-healing infra_hold.
+    if not accepted and not (r["events"] if r else []) and not (r or {}).get("finished_at"):
+        transient = True
+
     blocking = [] if accepted else _blocking(run_id)
     return accepted, merged, run_id, blocking, transient, cooldown, cost, brief, pushed, rework
 
