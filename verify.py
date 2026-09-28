@@ -700,6 +700,17 @@ def verify_classification() -> None:
           "the preflight probes the BUILDER, not only the judge",
           "a healthy judge over a dead builder produces nothing")
 
+    # --- reviewing an unchanged tree twice -----------------------------------------------------
+    # The main loop reviews, gets findings, then routed to the architect — which re-reviewed the
+    # IDENTICAL tree. 10% of every review this factory has run was that duplicate.
+    _ar = _i.getsource(feature.Lane._architect_resolve)
+    check("if findings is None:" in _ar,
+          "the architect accepts findings from a caller that just reviewed",
+          "re-reviewing an unchanged tree spends a judge call to learn what we know")
+    _fp = _i.getsource(feature.Lane._feature_phases)
+    check("_architect_resolve(run, findings)" in _fp,
+          "the architect-first route passes its findings through")
+
     # --- a conflicted merge must not wedge the origin -------------------------------------------
     # The three-week outage. git leaves the repo mid-merge on conflict; returning without aborting
     # left MERGE_HEAD and conflict markers in the origin, so every later run died on the I4

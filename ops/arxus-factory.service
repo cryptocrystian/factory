@@ -21,7 +21,7 @@ Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/r
 #
 # Parallelism is not free here; it is borrowed from the production workload. Raise N only on the
 # worker tier (exe.dev), where a lane gets its own machine.
-ExecStart=/root/.local/bin/uv run orchestrator.py --daemon --max-parallel 3 --poll 20
+ExecStart=/root/.local/bin/uv run orchestrator.py --daemon --max-parallel 2 --poll 20
 Restart=always
 RestartSec=10
 

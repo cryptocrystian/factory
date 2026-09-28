@@ -314,7 +314,7 @@ class Lane:
             # against a reviewer repeating "0012_bqs.sql is absent".
             if self.live and needs_protected_path(findings):
                 run.tracer.log(event_detail="routed_to_architect_first", blocking=findings)
-                accepted = self._architect_resolve(run)
+                accepted = self._architect_resolve(run, findings)   # tree unchanged since the review
             else:
                 accepted = self._converge(run, findings, unit_ok[1])
         # The builder can't write protected paths (migrations, canon). When it can't converge, the
@@ -367,7 +367,7 @@ class Lane:
             findings = ledger_findings + list(findings)
             accepted = (unit_ok[0] and approved and self._agent_gates_ok and not ledger_findings)
             if not accepted:
-                accepted = (self._architect_resolve(run) if needs_protected_path(findings)
+                accepted = (self._architect_resolve(run, findings) if needs_protected_path(findings)
                             else self._converge(run, findings, unit_ok[1]))
             if not accepted and self.live:
                 accepted = self._architect_resolve(run)
@@ -649,7 +649,7 @@ class Lane:
         run.tracer.log(event_detail="not_converged", iters=MAX_FIX_ITERS)
         return False
 
-    def _architect_resolve(self, run) -> bool:
+    def _architect_resolve(self, run, findings=None) -> bool:
         """The architect authority loop — closes the governance hole. Invoked when the builder can't
         converge, which is almost always because the fix lives in a protected path the builder may
         not write (a migration, canon). The architect triages the reviewer's blocking findings,
@@ -661,9 +661,14 @@ class Lane:
         cannot touch tests or app source, so it can never green a build by weakening the tests. Canon
         it can write — the never-weaken-canon rule is held by its charter, the different-family tests
         it cannot edit, and the audit trail here."""
-        approved, findings, _ = self._review(run)          # current blocking findings post-builder-loop
-        if approved and self._retest(run):                 # never accept on a stale green (§6.5)
-            return True
+        if findings is None:
+            approved, findings, _ = self._review(run)      # current blocking findings post-builder-loop
+            if approved and self._retest(run):             # never accept on a stale green (§6.5)
+                return True
+        # else: the caller reviewed this exact tree and is handing us its findings. Re-reviewing an
+        # unchanged tree spends a judge call to learn what we already know — 10% of every review
+        # this factory has ever run. Only a caller whose tree is unchanged since its review may pass
+        # findings; _converge mutates the tree, so its callers must leave this None.
         for i in range(1, MAX_ARCH_ROUNDS + 1):
             if self._budget_spent(run):
                 return self._unresolved(run, findings)
