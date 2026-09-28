@@ -414,6 +414,63 @@ def _target_of(item):
 
 
 # --- provider preflight: never spend a build the judge family cannot certify ----------------------
+
+class AuthGate:
+    """Refuses dispatch when a provider we depend on is NOT REPORTING AT ALL.
+
+    Distinct from JudgeGate, and deliberately so. JudgeGate probes the REVIEWER with a real
+    completion and catches a rate-limited or overloaded judge. Nothing probed the BUILDER, and
+    nothing at all noticed a provider whose credentials had simply died — an expired refresh token
+    removes the provider from `omp usage` entirely, which reads as 0% used rather than 100%.
+
+    That combination let the Anthropic builder sit dead for 18 days: every meter showed healthy
+    headroom, the judge preflight passed on a healthy Codex, and the daemon dispatched nothing at
+    all, logging nothing after "daemon up". Quota tells you a provider is busy. Only absence tells
+    you it is gone.
+
+    Costs no tokens — it reads the usage report, never a model."""
+
+    def __init__(self, check=None, ttl=600, clock=time.monotonic, log=print, notify=None):
+        self._check = check or self._default_check
+        self._ttl, self._clock, self._log = ttl, clock, log
+        self._notify = notify
+        self._ok_until = 0.0
+        self._alerted: set = set()
+
+    @staticmethod
+    def _default_check():
+        sys.path.insert(0, str(FACTORY_ROOT / "control-plane"))
+        import quota
+        dead = quota.auth_failures()
+        return dead, (quota.auth_reason(dead[0]) if dead else "")
+
+    def ready(self) -> bool:
+        now = self._clock()
+        if now < self._ok_until:
+            return True
+        try:
+            dead, reason = self._check()
+        except Exception as ex:                    # a broken check must never stop the factory
+            self._log(f"  ⋯ auth preflight failed ({ex}) — dispatching anyway", flush=True)
+            self._ok_until = now + self._ttl
+            return True
+        if not dead:
+            self._ok_until = now + self._ttl
+            self._alerted.clear()                  # recovered: a future outage alerts again
+            return True
+        self._log(f"  ⛔ hold      dispatch — provider(s) NOT REPORTING: {', '.join(dead)} "
+                  f"({reason or 'credentials expired'}). This is not quota; re-login is required: "
+                  f"omp auth-broker login {dead[0]}", flush=True)
+        key = ",".join(dead)
+        if self._notify and key not in self._alerted:
+            self._alerted.add(key)                 # once per outage, not every poll
+            try:
+                self._notify(dead, reason)
+            except Exception:
+                pass
+        return False
+
+
 class JudgeGate:
     """Holds dispatch while the cross-family reviewer's provider is down.
 
@@ -425,9 +482,21 @@ class JudgeGate:
     is not probing every poll; an unhealthy one parks dispatch for the cooldown the provider itself
     advertised, floored at 5 minutes and capped at an hour."""
     def __init__(self, probe=None, ttl=JUDGE_PROBE_TTL, clock=time.monotonic, log=print):
-        self._probe = probe or (lambda: omp.probe("reviewer"))
+        # Probe BOTH sides of the ladder. A healthy judge over a dead builder produces nothing but
+        # burned poll cycles — which is exactly what ran for 18 days.
+        self._probe = probe or self._default_probe
         self._ttl, self._clock, self._log = ttl, clock, log
         self._ok_until = self._hold_until = 0.0
+
+    @staticmethod
+    def _default_probe():
+        """Reviewer first (it is the scarcer family), then builder. The first failure names the
+        role, so the log says WHICH side is down rather than just "no route"."""
+        for role in ("reviewer", "builder"):
+            ok, wait, err = omp.probe(role)
+            if not ok:
+                return False, wait, f"{role}: {err}"
+        return True, 0.0, ""
 
     def ready(self) -> bool:
         now = self._clock()
@@ -504,7 +573,14 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
     merge_retries: dict[str, int] = {}
     infra_retries: dict[str, int] = {}                 # transient (model overloaded / no envelope) retries
     rework_retries: dict[str, int] = {}                # unclosed technical findings -> remediation retries
-    judge = JudgeGate()                                # preflight: is the reviewer family up?
+    auth = AuthGate(notify=lambda dead, why: nt.post(
+        project="—",
+        text=(f"⛔ FACTORY HELD — provider(s) not reporting: {', '.join(dead)}\n"
+              f"{why or 'credentials expired or logged out'}\n\n"
+              f"This is NOT quota exhaustion. Every route through {dead[0]} fails until you "
+              f"re-login:\n    omp auth-broker login {dead[0]}"),
+        facet="product"))                              # preflight: are our providers even THERE?
+    judge = JudgeGate()                                # preflight: are the judge AND builder up?
     migration_claims: dict[str, str] = {}              # item_id -> reserved migration number
     cycle_failures = 0                                 # consecutive cycles that raised
     delivery_warned: dict[str, str] = {}               # repo -> last delivery warning printed
@@ -653,10 +729,13 @@ def run_daemon(max_parallel=3, poll_s=20, max_merge_retries=3):
             dispatchable = [i for i in ready(items) if i["id"] not in inflight
                             and i.get("repo") not in dispatch_blocked
                             and retry_after.get(i["id"], 0) <= time.monotonic()]
-            # Nothing is dispatched while the judge family is down — a build that cannot be reviewed is
-            # spend with no possible outcome. Checked only when there is actually something to dispatch.
+            # Nothing is dispatched while a provider is GONE (auth) or DOWN (quota). Auth is checked
+            # first and costs no tokens: probing a model on a provider whose credentials expired just
+            # produces a confusing error, when the real answer is "re-login". A build that cannot be
+            # reviewed is spend with no possible outcome; a build that cannot start is not even that.
+            # Both are checked only when there is actually something to dispatch.
             for item in (dispatchable if (dispatchable and len(inflight) < max_parallel
-                                          and judge.ready()) else []):
+                                          and auth.ready() and judge.ready()) else []):
                 if len(inflight) >= max_parallel:
                     break
                 if item["id"] in inflight:

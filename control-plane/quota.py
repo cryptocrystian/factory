@@ -112,6 +112,61 @@ def delta(before: dict[str, float], after: dict[str, float]) -> dict[str, float]
     return out
 
 
+
+def provider_of(model: str) -> str:
+    """The provider id a model route resolves to. A bare name (claude-opus-5) is Anthropic's."""
+    if "/" in model:
+        return model.split("/")[0]
+    return "anthropic" if model.startswith(("claude-", "anthropic")) else ""
+
+
+def expected_providers() -> set[str]:
+    """Every provider the configured roles actually depend on, primaries and free fallbacks.
+
+    Derived from config rather than hardcoded, so adding a role or changing a route cannot leave
+    this list quietly stale — the failure this whole module exists to prevent."""
+    import config
+    out = set()
+    for name in config.ROLES:
+        out.add(provider_of(config.role(name).model))
+        for m in config.model_chain(name):
+            if not config.is_paid_route(m):
+                out.add(provider_of(m))
+    return {p for p in out if p}
+
+
+def auth_failures(meters=None) -> list[str]:
+    """Providers we depend on that are NOT REPORTING AT ALL.
+
+    This is a different failure from exhaustion and must never be confused with it. An exhausted
+    provider appears with its meters at 100%; a provider whose credentials died DISAPPEARS from the
+    report entirely — `omp usage` lists it as "0 accounts ... Refresh token expired". Read only as
+    percentages, that is indistinguishable from 0% used, which is how the Anthropic builder sat dead
+    for 18 days while every dashboard showed healthy quota and the daemon dispatched nothing.
+
+    Absence is the alarm."""
+    meters = snapshot() if meters is None else meters
+    if not meters:
+        return []                       # omp unreachable: that is a different problem, not auth
+    reporting = {m.provider for m in meters}
+    return sorted(expected_providers() - reporting)
+
+
+def auth_reason(provider: str, timeout_s: int = 45) -> str:
+    """The human-readable reason a provider is down, from omp's text output ("Refresh token
+    expired", "logged out by user"). Best-effort: the machine signal is absence, this is for the
+    person who has to fix it."""
+    try:
+        proc = subprocess.run([OMP_BIN, "usage"], capture_output=True, text=True, timeout=timeout_s)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    for line in (proc.stdout or "").splitlines():
+        if "✗" in line and ("disabled" in line or "expired" in line):
+            tail = line.split(":", 1)[-1].strip() if ":" in line else line.strip()
+            return tail[:160]
+    return ""
+
+
 def exhausted_providers(meters) -> list[str]:
     """Providers with at least one fully-spent window — a judge family here cannot certify a build."""
     return sorted({m.provider for m in meters if m.exhausted})
@@ -136,6 +191,15 @@ def report(meters=None) -> str:
         flag = "  ← METERED (own ceiling, billable overage)" if m.is_fable else ""
         flag = "  ← EXHAUSTED" if m.exhausted else flag
         lines.append(f"  {m.bar()}  {m.used_fraction * 100:5.1f}%  {m.label}{_fmt_reset(m.resets_in_s)}{flag}")
+    dead = auth_failures(meters)
+    if dead:
+        # Loudest line in the report: this is not a busy provider, it is a gone one.
+        lines.append(f"\n✗ NOT REPORTING: {', '.join(dead)} — credentials expired or logged out. "
+                     f"This is NOT quota exhaustion; the provider is gone and every route through "
+                     f"it fails. Fix: omp auth-broker login <provider>")
+        reason = auth_reason(dead[0])
+        if reason:
+            lines.append(f"  reason: {reason}")
     spent = exhausted_providers(meters)
     if spent:
         lines.append(f"\nexhausted: {', '.join(spent)} — a judge family here cannot certify a build")

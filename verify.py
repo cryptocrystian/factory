@@ -659,11 +659,51 @@ def verify_classification() -> None:
     sys.path.insert(0, str(ROOT / "lanes"))
     import feature
 
+    # --- a provider that is GONE vs one that is BUSY -------------------------------------------
+    # The 18-day outage. An exhausted provider reports meters at 100%; one whose credentials died
+    # DISAPPEARS from the usage report, which reads as 0% used. Confusing the two means every
+    # dashboard shows healthy headroom while nothing can run.
+    import quota as _q
+    import orchestrator as _orch
+
+    class _M:
+        def __init__(self, p): self.provider, self.used_fraction, self.label = p, 0.0, "w"
+        @property
+        def exhausted(self): return self.used_fraction >= 0.999
+
+    _expected = _q.expected_providers()
+    check("anthropic" in _expected,
+          "the builder's provider is in the expected set", "derived from config, not hardcoded")
+    present = [_M(p) for p in _expected]
+    check(_q.auth_failures(present) == [],
+          "all providers reporting -> no auth alarm")
+    missing = [_M(p) for p in _expected if p != "anthropic"]
+    check(_q.auth_failures(missing) == ["anthropic"],
+          "a provider ABSENT from the report is an auth failure",
+          "absence is the alarm; it is not 0% usage")
+    burnt = [_M(p) for p in _expected]
+    for m in burnt:
+        m.used_fraction = 1.0
+    check(_q.auth_failures(burnt) == [] and _q.exhausted_providers(burnt) == sorted(_expected),
+          "a provider at 100% is EXHAUSTED, not an auth failure",
+          "busy and gone are different alarms and need different fixes")
+    check(_q.auth_failures([]) == [],
+          "an unreachable omp is not reported as an auth failure",
+          "no data is not evidence of expiry")
+
+    # the dispatch preflight must hold on auth, and must probe the BUILDER as well as the judge
+    import inspect as _i
+    _ag = _i.getsource(_orch.AuthGate)
+    check("return False" in _ag and "auth-broker login" in _ag,
+          "the auth gate HOLDS dispatch and names the fix")
+    check('"reviewer", "builder"' in _i.getsource(_orch.JudgeGate),
+          "the preflight probes the BUILDER, not only the judge",
+          "a healthy judge over a dead builder produces nothing")
+
     # --- unjudged work vs judged work ----------------------------------------------------------
     # Resuming is only safe for work no reviewer ever saw. A build the reviewer REJECTED is tainted
     # and belongs in the fix loop against its findings; a build killed by a provider outage is
     # merely unreviewed. Getting this backwards would re-present rejected code as if it were fresh.
-    import orchestrator as _orch
     _judged = lambda r: any(k in r.lower() for k in _orch._UNJUDGED)
     check(_judged("reviewer unavailable (infra): provider failure"),
           "an infra death leaves work that MAY be resumed", "it was never judged")
