@@ -39,6 +39,7 @@ class Meter:
     label: str
     used_fraction: float          # 0.0 - 1.0
     resets_in_s: float | None
+    window: str = ""              # "5h" / "7d" — disambiguates same-labelled meters
 
     @property
     def is_fable(self) -> bool:
@@ -83,6 +84,7 @@ def snapshot(timeout_s: int = 60) -> list[Meter]:
             resets_at = (lim.get("window") or {}).get("resetsAt")
             resets_in = ((resets_at - now_ms) / 1000.0) if (resets_at and now_ms) else None
             out.append(Meter(provider=provider,
+                             window=str((lim.get("window") or {}).get("id") or ""),
                              label=str(lim.get("label") or lim.get("id") or "?"),
                              used_fraction=float(frac),
                              resets_in_s=resets_in))
@@ -90,7 +92,11 @@ def snapshot(timeout_s: int = 60) -> list[Meter]:
 
 
 def key(m: Meter) -> str:
-    return f"{m.provider}:{m.label}"
+    """Include the WINDOW. Antigravity reports two meters both labelled "Usage (Google)" — a weekly
+    and a daily — so a provider:label key silently collapsed them and the daily (0%) overwrote the
+    weekly (65%). An attribution instrument that loses the reading it exists to take is worse than
+    none, because it reports zero consumption with confidence."""
+    return f"{m.provider}:{m.label}" + (f" [{m.window}]" if m.window else "")
 
 
 def as_dict(meters) -> dict[str, float]:

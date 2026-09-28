@@ -700,6 +700,19 @@ def verify_classification() -> None:
           "the preflight probes the BUILDER, not only the judge",
           "a healthy judge over a dead builder produces nothing")
 
+    # --- two meters, one label -----------------------------------------------------------------
+    # Antigravity reports a weekly AND a daily meter both labelled "Usage (Google)". A
+    # provider:label key collapsed them, the daily (0%) overwrote the weekly (100%), and the
+    # attribution path reported zero consumption with confidence.
+    _m1 = _q.Meter(provider="p", label="Usage (Google)", used_fraction=1.0, resets_in_s=None, window="weekly")
+    _m2 = _q.Meter(provider="p", label="Usage (Google)", used_fraction=0.0, resets_in_s=None, window="daily")
+    _d = _q.as_dict([_m1, _m2])
+    check(len(_d) == 2,
+          "same-labelled meters in different windows do not collide",
+          "a collapsed key loses the reading the instrument exists to take")
+    check(max(_d.values()) == 1.0,
+          "the exhausted window survives the keying")
+
     # --- reviewing an unchanged tree twice -----------------------------------------------------
     # The main loop reviews, gets findings, then routed to the architect — which re-reviewed the
     # IDENTICAL tree. 10% of every review this factory has run was that duplicate.
