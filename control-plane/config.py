@@ -88,18 +88,34 @@ ROLES: dict[str, Role] = {
 #
 # Ids are overridable per role by env var, because an aggregator's catalog moves faster than this
 # file does.
+# The Gemini ladder on the Antigravity subscription, strongest first. See the note below.
+_AG = ("google-antigravity/gemini-3.1-pro",
+       "google-antigravity/gemini-3-pro",
+       "google-antigravity/gemini-2.5-pro",
+       "google-antigravity/gemini-3.7-flash-tiered")
+
 _FALLBACK_DEFAULTS: dict[str, tuple[str, ...]] = {
     # Position 2 is a SECOND FREE FAMILY, not a paid route. Gemini 3.1 Pro on the Antigravity
     # subscription: frontier tier, 1M context, zero marginal cost, and its own daily+weekly quota
     # independent of Codex's. The single-judge ceiling — one exhausted subscription halting the
     # whole factory for six days — is what this removes. Position 3 stays paid and last.
     #
-    # Antigravity also serves Claude and GPT-OSS. The model id is pinned to Gemini deliberately:
+    # Antigravity also serves Claude and GPT-OSS. The models are pinned to GEMINI deliberately:
     # a judge on the builder's family would silently void the cross-family independence (I3) that
     # makes the review worth anything.
-    "test-author":     ("google-antigravity/gemini-3.1-pro", "openrouter/openai/gpt-5.6-sol"),
-    "reviewer":        ("google-antigravity/gemini-3.1-pro", "openrouter/openai/gpt-5.6-terra"),
-    "product-manager": ("google-antigravity/gemini-3.1-pro", "openrouter/openai/gpt-5.6-sol"),
+    #
+    # SEVERAL Gemini models, not one. A provider's quota and a MODEL's rate limit are different
+    # ceilings, and naming a single model conflates them. On 2026-09-29 the Antigravity daily bucket
+    # sat at 63.6% — paid, upgraded, plenty of headroom — while gemini-3.1-pro alone returned 429
+    # RESOURCE_EXHAUSTED with a 30-minute cooldown. Four other Gemini models on the SAME quota
+    # answered on the first try. The factory was "out of tokens" with tokens it had already bought,
+    # because the chain could only ask one way. probe() and run() walk the chain, so widening it
+    # costs nothing when the first model is healthy and recovers the whole subscription when it is
+    # not. Pro tier first (a reviewer's judgment is the product), flash last as a live-but-weaker
+    # route in preference to holding the queue.
+    "test-author":     _AG + ("openrouter/openai/gpt-5.6-sol",),
+    "reviewer":        _AG + ("openrouter/openai/gpt-5.6-terra",),
+    "product-manager": _AG + ("openrouter/openai/gpt-5.6-sol",),
 }
 
 

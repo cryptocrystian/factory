@@ -700,6 +700,21 @@ def verify_classification() -> None:
           "the preflight probes the BUILDER, not only the judge",
           "a healthy judge over a dead builder produces nothing")
 
+    # --- a provider's quota vs a MODEL's rate limit ---------------------------------------------
+    # Different ceilings. On 2026-09-29 the Antigravity daily bucket was at 63.6% — paid and
+    # healthy — while gemini-3.1-pro alone returned 429 RESOURCE_EXHAUSTED; four other Gemini
+    # models on that same quota answered immediately. A chain naming one model per provider cannot
+    # tell the two apart and reports "out of tokens" while holding tokens it has already bought.
+    for _role in ("reviewer", "test-author"):
+        _ch = config.model_chain(_role)
+        _ag = [m for m in _ch if m.startswith("google-antigravity/")]
+        check(len(_ag) >= 2,
+              f"{_role} can reach its paid provider by more than one model",
+              f"{len(_ag)} Antigravity route(s): a single-model chain conflates provider quota with model rate limit")
+        check(all("gemini" in m for m in _ag),
+              f"{_role}'s Antigravity routes stay cross-family (I3)",
+              "Antigravity also serves Claude; a Claude judge over a Claude builder voids independence")
+
     # --- two meters, one label -----------------------------------------------------------------
     # Antigravity reports a weekly AND a daily meter both labelled "Usage (Google)". A
     # provider:label key collapsed them, the daily (0%) overwrote the weekly (100%), and the
