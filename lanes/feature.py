@@ -215,6 +215,7 @@ class Lane:
         self._review_cycles = 0            # total reviews this run — the ceiling over the nested loops
         self._run_started = time.monotonic()
         self._seen_findings: list[str] = []
+        self._converged_findings = None   # findings whose tree state is still current
         # Shared with the SIGTERM recorder so a killed run can still be written down (see
         # _install_kill_recorder). A dict, not an attribute, so the handler sees updates.
         self._active: dict = {}
@@ -326,7 +327,7 @@ class Lane:
         # regression rather than test it — which is exactly what it did until 2026-08-19, leaving the
         # only zero-cost end-to-end check un-runnable from the day the architect was added.
         if not accepted and self.live:
-            accepted = self._architect_resolve(run)
+            accepted = self._architect_resolve(run, getattr(self, "_converged_findings", None))
         self._record_cost(run, accepted)
         return run.finish(accepted, reason="" if accepted else self._escalation_reason())
 
@@ -627,6 +628,7 @@ class Lane:
                 # who owns it, then spend the next iteration properly — JRN-B1's builder tried to
                 # author `0016_scored_input_write_boundary.sql` and simply failed, repeatedly.
                 run.tracer.log(event_detail="builder_breach_corrected", i=i, breach=breach)
+                self._converged_findings = None   # the rollback changed the tree; re-review is real work
                 findings = [f"Your write to {', '.join(breach)} was ROLLED BACK — it is outside your "
                             f"grant. {_grant_owner(breach)}.", *findings]
                 continue
@@ -640,6 +642,11 @@ class Lane:
                              "name it. Tests only. Return your envelope."))
             ledger_findings = self._ledger(run)
             approved, findings, _ = self._review(run)
+            # The tree now matches THIS review. If the loop exits from here (budget, no-progress,
+            # or iterations spent) the architect must not re-review an unchanged tree: that pair
+            # showed up four times in one JRN-S5 run, ~40% of its reviews. Cleared below on any
+            # path that mutates the tree afterwards.
+            self._converged_findings = list(findings)
             findings = ledger_findings + list(findings)
             # A declared gate still unmet is not an accepted build, whatever the review says: the
             # planner promised it, and code says it is not there.

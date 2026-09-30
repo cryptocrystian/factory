@@ -700,6 +700,21 @@ def verify_classification() -> None:
           "the preflight probes the BUILDER, not only the judge",
           "a healthy judge over a dead builder produces nothing")
 
+    # --- reviewing an unchanged tree twice, the second case ---------------------------------------
+    # _converge's fix loop ENDS with a review, so when it returns False the tree still matches that
+    # review — and the post-converge architect call re-reviewed it. Four such pairs appeared in one
+    # JRN-S5 run, ~40% of its reviews. The rollback path is the exception: it mutates the tree after
+    # the review, so it must invalidate rather than reuse.
+    _cv = _i.getsource(feature.Lane._converge)
+    check("self._converged_findings = list(findings)" in _cv,
+          "the fix loop records the findings its final review produced")
+    check("self._converged_findings = None" in _cv,
+          "a rolled-back write invalidates them",
+          "the tree changed after that review, so re-reviewing is real work")
+    _fp2 = _i.getsource(feature.Lane._feature_phases)
+    check("_architect_resolve(run, getattr(self, \"_converged_findings\", None))" in _fp2,
+          "the post-converge architect route reuses them when they are still current")
+
     # --- a provider's quota vs a MODEL's rate limit ---------------------------------------------
     # Different ceilings. On 2026-09-29 the Antigravity daily bucket was at 63.6% — paid and
     # healthy — while gemini-3.1-pro alone returned 429 RESOURCE_EXHAUSTED; four other Gemini
