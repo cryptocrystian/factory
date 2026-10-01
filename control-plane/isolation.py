@@ -24,6 +24,13 @@ class GitError(RuntimeError):
     pass
 
 
+class DirtyOriginError(GitError):
+    """The origin tree is not clean, so no run may start. A PRECONDITION failure, not an outage: it
+    blocks every dispatch and no amount of waiting clears it. A GitError subclass so existing
+    handlers still catch it, but its own type so the RETRY path can refuse to spin on it — on
+    2026-10-01 one untracked plan.md produced 384 JRN-T1 runs at the 20s poll interval."""
+
+
 def _git(repo: Path, *args: str) -> str:
     p = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
     if p.returncode != 0:
@@ -92,8 +99,18 @@ class WorktreeIsolation:
         origin = Path(origin).resolve()
         base_branch = _git(origin, "rev-parse", "--abbrev-ref", "HEAD").strip()
         base_commit = _git(origin, "rev-parse", "HEAD").strip()
-        if bool(_git(origin, "status", "--porcelain").strip()):
-            raise GitError("origin repo is dirty; a run must start from a clean tree (I4)")
+        dirt = _git(origin, "status", "--porcelain").strip()
+        if dirt:
+            # NAME THE FILES, and say plainly that this is not self-healing. A dirty origin blocks
+            # EVERY dispatch, and on 2026-10-01 a single untracked plan.md produced 384 JRN-T1 runs
+            # at the 20s poll interval, because the retry path treated it as transient infrastructure.
+            # It is not: no provider recovers a file that is sitting on disk. An operator clears it.
+            files = [ln[3:] for ln in dirt.splitlines()[:8]]
+            more = "" if len(dirt.splitlines()) <= 8 else f" (+{len(dirt.splitlines()) - 8} more)"
+            raise DirtyOriginError(
+                f"origin repo is dirty; a run must start from a clean tree (I4). "
+                f"THIS DOES NOT CLEAR ITSELF — no retry will fix it. Offending paths: "
+                f"{', '.join(files)}{more}")
         branch = f"factory/{run_id}"
         wt = self.worktrees_dir / run_id
         self.worktrees_dir.mkdir(parents=True, exist_ok=True)

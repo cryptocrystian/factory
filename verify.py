@@ -700,6 +700,42 @@ def verify_classification() -> None:
           "the preflight probes the BUILDER, not only the judge",
           "a healthy judge over a dead builder produces nothing")
 
+    # --- a precondition failure vs a provider outage ---------------------------------------------
+    # 384 JRN-T1 run records from ONE untracked file. A dirty origin crashes the lane in
+    # Run.__init__ before any event exists; the orchestrator saw "no events", classified it
+    # transient, and retried at the 20s poll. No provider recovers a file sitting on disk.
+    import tempfile as _tf2, subprocess as _sp2
+    import isolation as _im
+
+    def _g2(d, *a):
+        return _sp2.run(["git", *a], cwd=str(d), capture_output=True, text=True).stdout
+
+    _t = Path(_tf2.mkdtemp()); _or = _t / "o"; _or.mkdir()
+    _g2(_or, "init", "-q", "-b", "main"); _g2(_or, "config", "user.email", "t@t"); _g2(_or, "config", "user.name", "t")
+    (_or / "a.txt").write_text("x\n"); _g2(_or, "add", "-A"); _g2(_or, "commit", "-q", "-m", "c")
+    (_or / "stray.md").write_text("debris\n")                 # untracked, exactly the plan.md case
+    _iso2 = _im.WorktreeIsolation(_t / "wt")
+    try:
+        _iso2.acquire(_or, "dirtycheck"); _raised = None
+    except _im.GitError as _ex:
+        _raised = _ex
+    check(isinstance(_raised, _im.DirtyOriginError),
+          "a dirty origin raises DirtyOriginError, not a bare GitError",
+          "its own type is what lets the retry path refuse to spin on it")
+    check(isinstance(_raised, _im.GitError),
+          "DirtyOriginError is still a GitError", "existing handlers keep working")
+    check("stray.md" in str(_raised),
+          "the offending path is NAMED in the error",
+          "an operator cannot clear what the message does not identify")
+    check("DOES NOT CLEAR ITSELF" in str(_raised),
+          "the error states it is not self-healing")
+
+    # and no role may be handed the ORIGIN as a writable dir — permissions.py guards the workspace
+    _lane_src = (ROOT / "lanes" / "feature.py").read_text()
+    check("add_dirs=[self.repo]" not in _lane_src,
+          "no role receives the origin repo as an add_dir",
+          "permissions.py enforces against run.workspace, so an origin grant is unguarded")
+
     # --- reviewing an unchanged tree twice, the second case ---------------------------------------
     # _converge's fix loop ENDS with a review, so when it returns False the tree still matches that
     # review — and the post-converge architect call re-reviewed it. Four such pairs appeared in one

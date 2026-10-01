@@ -280,9 +280,13 @@ class Lane:
             ph.ok()
 
         # -- plan (writes plan.md into the run dir; not committed to the repo) --
+        # add_dirs is the WORKSPACE, never self.repo. permissions.py enforces writes against
+        # run.workspace, so handing a role the ORIGIN gives it a writable path nothing guards —
+        # which is how a 36KB plan.md landed in the origin on 2026-10-01, went un-rolled-back, and
+        # then blocked every dispatch for 384 runs on the I4 clean-tree check.
         plan = self._agent(run, "planner", "plan",
                            prompt=self._planner_prompt(run),
-                           cwd=run.dir, add_dirs=[self.repo],
+                           cwd=run.dir, add_dirs=[run.workspace],
                            gate_fns=[gates.artifacts_exist])
         if plan is None:
             return run.finish(False, reason="planning failed")
@@ -414,7 +418,7 @@ class Lane:
                            prompt=("Read context.md — a foundation brief (a cross-cutting build, not a "
                                    "single user journey). Produce plan.md and your envelope per your "
                                    "system instructions."),
-                           cwd=run.dir, add_dirs=[self.repo], gate_fns=[gates.artifacts_exist])
+                           cwd=run.dir, add_dirs=[run.workspace], gate_fns=[gates.artifacts_exist])
         if plan is None:
             return run.finish(False, reason="planning failed")
         l0_ok = self._build(run, plan)

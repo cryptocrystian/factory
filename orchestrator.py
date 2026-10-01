@@ -100,6 +100,18 @@ def delivery_state(repo: str) -> tuple[bool, str]:
     repo also guarantees the next merge either strands too or loses the base-moved check (I11)."""
     try:
         path = Path(repo_path(repo))
+        # A DIRTY TREE IS CHECKED HERE, BEFORE DISPATCH — not discovered by the lane.
+        # isolation.acquire() raises on a dirty origin, which crashes the lane in Run.__init__ before
+        # it records a single event. The orchestrator then sees a run with no events, classifies it
+        # transient, and retries at the poll interval. On 2026-10-01 one untracked 36KB plan.md
+        # produced 384 JRN-T1 run records that way. Checking it as a dispatch precondition means the
+        # lane never spawns: no run record, no retry counter, one warning until an operator clears it.
+        dirt = _git_out(path, "status", "--porcelain")
+        if dirt:
+            names = [ln[3:] for ln in dirt.splitlines()[:5]]
+            extra = "" if len(dirt.splitlines()) <= 5 else f" +{len(dirt.splitlines()) - 5} more"
+            return False, (f"{repo} working tree is DIRTY — every run would die on the I4 clean-tree "
+                           f"check. This does not clear itself: {', '.join(names)}{extra}")
         branch = _git_out(path, "rev-parse", "--abbrev-ref", "HEAD")
         _git_out(path, "fetch", "--quiet", "origin", branch)
         counts = _git_out(path, "rev-list", "--left-right", "--count", f"origin/{branch}...HEAD")
