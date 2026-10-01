@@ -229,8 +229,19 @@ def probe(role_name: str, timeout_s: int = 90) -> tuple[bool, float, str]:
     # the factory for no reason.
     import meter
     for model in config.model_chain(role_name):
-        if model.startswith("openrouter/") and not meter.allow_paid()[0]:
-            continue                           # below the balance floor: not a route we may take
+        if config.is_paid_route(model):
+            prov = model.split("/")[0]
+            # OpenRouter has a readable balance; everything else gets the call budget. Both must
+            # pass. The budget is what bounds an unattended night on a provider that will simply
+            # keep billing (2026-08-19), and it is counted here — at the point of use — so a route
+            # we skip is never charged against it.
+            if prov == "openrouter" and not meter.allow_paid()[0]:
+                continue                       # below the balance floor: not a route we may take
+            ok_budget, why_budget = meter.allow_paid_call(prov)
+            if not ok_budget:
+                worst_err = worst_err or f"{model}: {why_budget}"
+                continue
+            meter.record_paid_call(prov)
         argv = [config.OMP_BIN, "-p", "--mode", "json", "--no-title", "--model", model]
         try:
             proc = subprocess.run(argv, input="Reply with the single word OK.", capture_output=True,

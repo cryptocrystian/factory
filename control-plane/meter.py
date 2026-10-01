@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -119,3 +120,72 @@ class RunMeter:
         if self.start is None or self.end is None:
             return None
         return max(0.0, round(self.end - self.start, 4))
+
+# --------------------------------------------------------------------- per-provider paid call budget
+# A DOLLAR ceiling cannot be trusted here. omp's own cost figure under-reported OpenRouter spend by
+# 20-70x (2026-08-24: $0.34 reported against $9.67 actually billed), and xAI exposes no balance to
+# poll the way OpenRouter does. A CALL count is exact: the factory either made the request or it did
+# not. So the local guard bounds CALLS per provider per UTC day, and the real money backstop is a
+# hard spend cap set in the provider's own console — which is the only ceiling that cannot be wrong.
+PAID_CALL_BUDGET = Path(__file__).resolve().parent.parent / "runs" / "paid-calls.yml"
+
+# Deliberately low. A judge pass is a handful of calls, so this bounds an unattended overnight to
+# tens of requests rather than thousands — the 2026-08-19 failure mode. Raise it knowingly.
+DEFAULT_DAILY_CALLS = 120
+
+
+def daily_call_cap(provider: str) -> int:
+    key = "OMP_PAID_DAILY_CALLS_" + provider.upper().replace("-", "_")
+    raw = os.environ.get(key) or os.environ.get("OMP_PAID_DAILY_CALLS", "")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return DEFAULT_DAILY_CALLS
+
+
+def _today() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def paid_calls_today(provider: str) -> int:
+    try:
+        import yaml
+        data = yaml.safe_load(PAID_CALL_BUDGET.read_text()) or {}
+    except Exception:
+        return 0
+    return int((data.get(_today()) or {}).get(provider, 0))
+
+
+def record_paid_call(provider: str) -> int:
+    """Count one paid request, atomically. Returns the new count for today.
+
+    Locked read-modify-write via statefile: parallel lanes share this counter, and a budget two
+    lanes can both pass is not a budget."""
+    import statefile
+
+    def _bump(cur):
+        day = cur.setdefault(_today(), {})
+        day[provider] = int(day.get(provider, 0)) + 1
+        for k in [k for k in cur if k != _today()]:
+            del cur[k]                       # keep only today; this file is a guard, not a ledger
+        return cur
+
+    data = statefile.update(PAID_CALL_BUDGET, _bump,
+                            header="# Paid calls per provider per UTC day — a spend guard, not a ledger.\n",
+                            default={})
+    return int((data.get(_today()) or {}).get(provider, 0))
+
+
+def allow_paid_call(provider: str) -> tuple[bool, str]:
+    """May we make one more paid request to this provider today? Fails CLOSED.
+
+    Deliberately the opposite of allow_paid()'s fail-open balance check. An unreadable balance is a
+    metering outage and must not stop work; an exhausted call budget is the guard itself, and a
+    guard that opens when it cannot count is not a guard."""
+    cap = daily_call_cap(provider)
+    used = paid_calls_today(provider)
+    if used >= cap:
+        return False, (f"{provider}: {used}/{cap} paid calls used today (UTC). Raise "
+                       f"OMP_PAID_DAILY_CALLS_{provider.upper().replace('-', '_')} to continue.")
+    return True, f"{provider}: {used}/{cap} paid calls used today"
+

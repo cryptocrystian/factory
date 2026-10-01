@@ -128,9 +128,12 @@ def verify_config() -> None:
         chain = config.model_chain(role)
         check(not any("claude" in m or "anthropic" in m for m in chain),
               f"{role} never shares the builder's family (I3)")
-        check(all(m.startswith(config.SUBSCRIPTION_PROVIDERS) or m.startswith("openrouter/")
-                  for m in chain),
-              f"{role} uses no direct vendor API key", " → ".join(chain))
+        # Raw vendor keys stay forbidden by owner instruction; xAI is a NAMED exception
+        # (config.OWNER_AUTHORISED_DIRECT_KEYS), so any other raw key still fails here.
+        check(all(config.is_permitted_route(m) for m in chain),
+              f"{role} uses no UNAUTHORISED direct vendor API key", " → ".join(chain))
+        rogue = [m for m in chain if not config.is_permitted_route(m)]
+        check(not rogue, f"{role} has no rogue route", ", ".join(rogue) or "none")
         check(not any(("claude" in m or "anthropic" in m) for m in chain),
               f"{role} never lands on the builder's family, even via a multi-model provider")
         check(any("gemini" in m for m in chain), f"{role} carries a second family (Gemini)",

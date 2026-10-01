@@ -118,12 +118,18 @@ for _role in ('reviewer', 'test-author', 'product-manager'):
     check(f"{_role} primary names its provider", '/' in _chain[0], _chain[0])
     check(f"{_role} primary is the subscription", _chain[0].startswith('openai-codex/'), _chain[0])
     check(f"{_role} routes are distinct", len(set(_chain)) == len(_chain))
-check("no fallback uses a direct vendor API key",
-      all(m.startswith(config.SUBSCRIPTION_PROVIDERS) or m.startswith('openrouter/')
-          for m in chain[1:]),
-      "subscriptions or OpenRouter only — never a raw vendor key")
-check("every METERED route goes through OpenRouter",
-      all(m.startswith('openrouter/') for m in chain[1:] if config.is_paid_route(m)))
+check("no fallback uses an UNAUTHORISED direct vendor API key",
+      all(config.is_permitted_route(m) for m in chain[1:]),
+      "subscriptions, OpenRouter, or an owner-authorised key (config.OWNER_AUTHORISED_DIRECT_KEYS)")
+check("every METERED route is OpenRouter or owner-authorised",
+      all(m.startswith('openrouter/') or m.startswith(config.OWNER_AUTHORISED_DIRECT_KEYS)
+          for m in chain[1:] if config.is_paid_route(m)),
+      "one account to turn off, unless the owner named the exception")
+check("every metered route is spend-guarded",
+      all(m.startswith('openrouter/')                      # balance floor, meter.allow_paid
+          or m.split('/')[0] in ('xai',)                   # call budget, meter.allow_paid_call
+          for m in chain[1:] if config.is_paid_route(m)),
+      "a metered route with no ceiling is the 2026-08-19 overnight-billing failure")
 check("a second family backs up the judge",
       any('openai' not in m and 'gpt' not in m for m in chain[1:]),
       chain[-1])

@@ -128,14 +128,22 @@ class LiveRunner:
         for fallback in chain[1:]:
             if not res.infra_failed:
                 break
-            if fallback.startswith("openrouter/"):
-                allowed, why = meter.allow_paid()
+            if config.is_paid_route(fallback):
+                prov = fallback.split("/")[0]
+                # Two guards, both must pass. OpenRouter exposes a balance we can read; every other
+                # paid provider (xAI) just keeps billing, so it gets a per-day CALL budget instead —
+                # counts are exact where omp's cost figure under-reported by 20-70x. Stopping here
+                # is the point: the run aborts and re-queues, which costs time, where continuing
+                # would drain the account and still not land (2026-08-19).
+                allowed, why = (meter.allow_paid() if prov == "openrouter"
+                                else meter.allow_paid_call(prov))
                 if not allowed:
-                    # Below the floor. Stopping here is the point: the run aborts and re-queues,
-                    # which costs time, where continuing would drain the account and still not land.
                     run.tracer.log(event_detail="paid_route_refused", role=call.role,
                                    model=fallback, reason=why)
                     break
+                meter.record_paid_call(prov)
+                run.tracer.log(event_detail="paid_call_counted", provider=prov, model=fallback,
+                               budget=why)
             run.tracer.log(event_detail="provider_fallback", role=call.role,
                            from_model=chain[0], to_model=fallback, error=res.error)
             res = self._attempt(replace_call(call, resume_session=None), run, workspace, model=fallback)

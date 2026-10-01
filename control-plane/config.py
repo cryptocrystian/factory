@@ -94,6 +94,21 @@ _AG = ("google-antigravity/gemini-3.1-pro",
        "google-antigravity/gemini-2.5-pro",
        "google-antigravity/gemini-3.7-flash-tiered")
 
+# A THIRD judge family: xAI. Added 2026-10-01 when Codex's 7-day AND Antigravity's 7-day Google
+# window were both spent, leaving a builder with 75% headroom and nothing able to judge its output.
+# xAI family, so cross-family from the Anthropic builder and I3-legal. Several models for the same
+# reason the Gemini ladder has several: a provider's quota and a model's rate limit are different
+# ceilings. 2M context on the fast routes comfortably holds a 4,700-line diff; the beta reasoning
+# route is last because "beta" is not what an unattended judge should reach for first.
+#
+# These are API-keyed, so is_paid_route() is True and the call budget in meter.py applies. On the
+# free tier that guard must not BIND — a cap that idles the factory is the opposite of the point —
+# so OMP_PAID_DAILY_CALLS_XAI is set generously in the unit file. It stays in place so the guard is
+# already there if the key ever becomes billable.
+_XAI = ("xai/grok-4-1-fast",
+        "xai/grok-4",
+        "xai/grok-4.20-beta-latest-reasoning")
+
 _FALLBACK_DEFAULTS: dict[str, tuple[str, ...]] = {
     # Position 2 is a SECOND FREE FAMILY, not a paid route. Gemini 3.1 Pro on the Antigravity
     # subscription: frontier tier, 1M context, zero marginal cost, and its own daily+weekly quota
@@ -113,9 +128,9 @@ _FALLBACK_DEFAULTS: dict[str, tuple[str, ...]] = {
     # costs nothing when the first model is healthy and recovers the whole subscription when it is
     # not. Pro tier first (a reviewer's judgment is the product), flash last as a live-but-weaker
     # route in preference to holding the queue.
-    "test-author":     _AG + ("openrouter/openai/gpt-5.6-sol",),
-    "reviewer":        _AG + ("openrouter/openai/gpt-5.6-terra",),
-    "product-manager": _AG + ("openrouter/openai/gpt-5.6-sol",),
+    "test-author":     _AG + _XAI + ("openrouter/openai/gpt-5.6-sol",),
+    "reviewer":        _AG + _XAI + ("openrouter/openai/gpt-5.6-terra",),
+    "product-manager": _AG + _XAI + ("openrouter/openai/gpt-5.6-sol",),
 }
 
 
@@ -138,6 +153,24 @@ METERED_SUBSCRIPTION_MODELS = ("claude-fable-5",)
 # already only half the plan's, starving the roles that actually ship code.
 HIGH_VOLUME_ROLES = ("planner", "builder", "test-author", "reviewer")
 
+
+# Raw vendor API keys are forbidden BY OWNER INSTRUCTION ("we should not be using a direct OpenAI
+# key — that's the entire reason I purchased OpenRouter", 2026-08-19, after one was added without
+# asking). Metered inference goes through OpenRouter so there is one account, one balance and one
+# place to turn it off.
+#
+# OWNER-AUTHORISED EXCEPTION, 2026-10-01: xAI, as an interim third judge family, added while Codex's
+# and Antigravity's weekly windows were both spent. Named explicitly rather than loosening the rule,
+# so adding any OTHER raw vendor key still fails verify and still needs a decision.
+OWNER_AUTHORISED_DIRECT_KEYS = ("xai/",)
+
+
+def is_permitted_route(model: str) -> bool:
+    """A route the factory may take at all: a subscription, OpenRouter, or an owner-authorised
+    direct key. Separate from is_paid_route, which asks whether it COSTS, not whether it is allowed."""
+    return (model.startswith(SUBSCRIPTION_PROVIDERS)
+            or model.startswith("openrouter/")
+            or model.startswith(OWNER_AUTHORISED_DIRECT_KEYS))
 
 def is_paid_route(model: str) -> bool:
     return not model.startswith(SUBSCRIPTION_PROVIDERS)

@@ -9,6 +9,15 @@ User=root
 WorkingDirectory=/root/factory
 Environment=TERM=dumb
 Environment=HOME=/root
+# Paid fallbacks ON, because the third judge family (xAI) is API-keyed and would otherwise be
+# filtered out of every chain — a provider you cannot reach is not a fallback. Both metered routes
+# stay guarded, by different means: OpenRouter by its readable balance floor (meter.allow_paid),
+# xAI by a per-day CALL budget (meter.allow_paid_call), because counts are exact where omp's cost
+# figure under-reported by 20-70x. The xAI cap is set HIGH on purpose: the key is free-tier, and a
+# guard that idles the factory is the opposite of the point. It stays in place so the ceiling
+# already exists if that key ever becomes billable.
+Environment=OMP_ALLOW_PAID_FALLBACK=1
+Environment=OMP_PAID_DAILY_CALLS_XAI=2000
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin
 # Runs forever: dispatch N non-overlapping journeys concurrently, park escalations without stopping.
 #
