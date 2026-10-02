@@ -175,7 +175,25 @@ def _broker_env_candidates() -> tuple[str, ...]:
 # Pay-per-token provider keys (OpenRouter today) live beside the broker env, same discipline:
 # a file on the box, never a repo, never an argv. They are the FALLBACK path — the subscription
 # is always tried first, so nothing here is spent while quota is healthy.
-_PROVIDER_KEY_PREFIXES = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY")
+# XAI_API_KEY added 2026-10-02: ee0a856 authorised xAI as a judge family and the key was put in
+# providers.env, but it was never forwarded here — every xai/* call died "No API key found for xai"
+# and, being a stderr-only failure, read as a healthy probe. See _exit_error.
+_PROVIDER_KEY_PREFIXES = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "XAI_API_KEY")
+
+
+def _exit_error(returncode, stderr: str) -> str:
+    """omp FAILED BEFORE TALKING TO THE MODEL (missing key, unknown provider, bad flag): it exits
+    non-zero, writes nothing but a session line to stdout, and says why only on stderr. Return that
+    reason so the caller can treat it as a provider failure — the route is unusable, not the model
+    misbehaving. Empty when omp exited cleanly. Only consulted when the stream produced neither an
+    answer nor a provider error of its own."""
+    if returncode in (0, None):
+        return ""
+    lines = [l.strip() for l in (stderr or "").splitlines() if l.strip()]
+    for l in lines:
+        if l.lower().startswith("error:"):
+            return f"omp exit {returncode}: {l[:200]}"
+    return f"omp exit {returncode}: {lines[-1][:200] if lines else 'no output'}"
 
 
 def _provider_env_candidates() -> tuple[str, ...]:
@@ -281,6 +299,8 @@ def probe(role_name: str, timeout_s: int = 90) -> tuple[bool, float, str]:
         _sid, final, _cost, _n, provider_error, retry_after_s = _parse_stream(proc.stdout.splitlines())
         if final:                              # it answered — up, whatever else the stream said
             return True, 0.0, ""
+        # A route omp could not even open (no key, unknown provider) is down, not "no complaint".
+        provider_error = provider_error or _exit_error(proc.returncode, proc.stderr)
         if not provider_error:
             return True, 0.0, ""               # no answer, no provider complaint → not our call
         worst_wait = max(worst_wait, retry_after_s)
@@ -300,18 +320,19 @@ def run(call: E.AgentCall, run_dir: Path, workspace: Path, tracer=None,
     argv = _argv(call, r, session_dir, model)
 
     timed_out = False
+    err_out = ""
     # Spawn in a new session so the whole process tree can be reaped on timeout (start_new_session).
     proc = subprocess.Popen(
         argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, cwd=str(workspace), start_new_session=True, env=_child_env(),
     )
     try:
-        out, _ = proc.communicate(input=call.prompt, timeout=r.timeout_s)   # per-role budget (I9)
+        out, err_out = proc.communicate(input=call.prompt, timeout=r.timeout_s)   # per-role budget (I9)
     except subprocess.TimeoutExpired:
         timed_out = True
         _kill_tree(proc)                       # kill the group, not just the child
         try:
-            out, _ = proc.communicate(timeout=15)   # drain whatever was buffered before the kill
+            out, err_out = proc.communicate(timeout=15)   # drain whatever was buffered before the kill
         except Exception:
             out = ""
 
@@ -319,6 +340,10 @@ def run(call: E.AgentCall, run_dir: Path, workspace: Path, tracer=None,
     suffix = "" if model in (None, r.model) else f".{model.replace('/', '_')}"
     (run_dir / f"{call.role}{suffix}.jsonl").write_text(out)
     session_id, final_text, cost, n, provider_error, retry_after_s = _parse_stream(lines)
+    if not final_text and not provider_error and not timed_out:
+        # A timeout we killed is ours, not the route's (it resumes); anything else that exited
+        # non-zero without answering never reached the model.
+        provider_error = _exit_error(proc.returncode, err_out)
     if tracer:
         tracer.record_call(call.role, n, cost, timed_out)
 

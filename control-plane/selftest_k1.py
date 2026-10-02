@@ -173,6 +173,42 @@ os.environ['OMP_FALLBACK_REVIEWER'] = ''
 check("a fallback can be switched off by env", config.model_chain('reviewer') == (config.role('reviewer').model,))
 os.environ['OMP_FALLBACK_REVIEWER'] = 'openrouter/x/y'
 check("a fallback can be redirected by env", config.model_chain('reviewer')[-1] == 'openrouter/x/y')
+
+# 6. every metered vendor in a judge chain gets its key forwarded (2026-10-02: xAI was authorised
+#    and keyed in providers.env, but the key was never passed to omp — every xai/* call failed).
+print("provider keys + pre-model failures:")
+_vendor_key = {"openrouter": "OPENROUTER_API_KEY", "xai": "XAI_API_KEY"}
+_saved_override = os.environ.pop('OMP_FALLBACK_REVIEWER', None)   # check the DEFAULT chain
+os.environ['OMP_ALLOW_PAID_FALLBACK'] = '1'
+check("reviewer default chain includes xAI", any(m.startswith('xai/') for m in config.model_chain('reviewer')))
+for _role in ('reviewer', 'test-author', 'product-manager'):
+    for _m in config.model_chain(_role):
+        _p = _m.split('/')[0]
+        if config.is_paid_route(_m) and _p in _vendor_key:
+            check(f"{_role}: {_p} key is forwarded to omp", _vendor_key[_p] in omp._PROVIDER_KEY_PREFIXES)
+os.environ.pop('OMP_ALLOW_PAID_FALLBACK', None)
+if _saved_override is not None:
+    os.environ['OMP_FALLBACK_REVIEWER'] = _saved_override
+import tempfile
+with tempfile.TemporaryDirectory() as _d:
+    _f = Path(_d) / "providers.env"
+    _f.write_text("XAI_API_KEY=test-not-a-key\nUNRELATED=x\n")
+    os.environ['OMP_PROVIDER_ENV_FILE'] = str(_f)
+    _env = {}
+    omp._load_provider_keys(_env)
+    check("XAI_API_KEY loads from providers.env", _env.get("XAI_API_KEY") == "test-not-a-key")
+    check("unrelated variables are not loaded", "UNRELATED" not in _env)
+    del os.environ['OMP_PROVIDER_ENV_FILE']
+
+# omp failing BEFORE the model (no key) exits non-zero and explains only on stderr: that is a
+# downed route, and must read as one in run() and probe() — not as "no complaint".
+_nokey = "error: No API key found for xai.\n\nUse /login, set an API key environment variable"
+check("a pre-model exit is a provider error", "No API key found for xai" in omp._exit_error(1, _nokey),
+      omp._exit_error(1, _nokey))
+check("a clean exit is not an error", omp._exit_error(0, "noise") == "")
+check("a pre-model exit makes the result infra",
+      omp.AgentResult(ok=False, envelope=None, session_id="s", cost_usd=0.0, timed_out=False, events=1,
+                      raw_final="", error="", provider_error=omp._exit_error(1, _nokey)).infra_failed)
 del os.environ['OMP_FALLBACK_REVIEWER']
 os.environ.pop('OMP_ALLOW_PAID_FALLBACK', None)
 
