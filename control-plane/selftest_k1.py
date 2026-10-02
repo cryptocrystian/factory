@@ -99,6 +99,33 @@ check("never-answered with a provider error IS infra",
       omp.AgentResult(ok=False, envelope=None, session_id=None, cost_usd=0.0, timed_out=False,
                       events=3, raw_final="", error="", provider_error="rate limited").infra_failed)
 
+# A provider NOTICE delivered as assistant text is infra, not an answer (2026-10-02: a retired
+# gemini-3-pro replied "no longer available" with stopReason=error and 0 output tokens; the chain
+# stopped there, xAI was never reached, and probe() called the judge healthy). Shape-faithful
+# minimal stream, hand-written.
+import json as _json
+def _stream(stop, out_tokens, text, err=None):
+    msg = {"role": "assistant", "content": [{"type": "text", "text": text}],
+           "usage": {"input": 0, "output": out_tokens, "cost": {"total": 0}}, "stopReason": stop}
+    if err:
+        msg["errorMessage"] = err
+    return [_json.dumps({"type": "session", "id": "s-notice"}),
+            _json.dumps({"type": "message_end", "message": msg}),
+            _json.dumps({"type": "agent_end", "messages": [{"role": "user", "content": "go"}, msg]})]
+NOTICE = "Gemini 3 Pro is no longer available. Please switch to Gemini 3.1 Pro."
+_s, fin, _c, _n, perr, _w = omp._parse_stream(_stream("error", 0, NOTICE, "stream ended without a finish reason"))
+check("retired-model notice yields no final answer", fin == "", fin[:60])
+check("retired-model notice is captured as the provider error", "no longer available" in perr, perr[:80])
+check("retired-model notice IS infra (chain walks on, probe reports down)",
+      omp.AgentResult(ok=False, envelope=None, session_id=_s, cost_usd=0.0, timed_out=False,
+                      events=_n, raw_final=fin, error="", provider_error=perr).infra_failed)
+_s, fin, *_ = omp._parse_stream(_stream("error", 812, '{"status":"succ', "connection dropped"))
+check("errored AFTER real output is still model output (not a notice)", fin.startswith('{"status"'))
+_s, fin, _c, _n, perr, _w = omp._parse_stream(_stream("stop", 0, "not json"))
+check("a normal stop with text is an answer, however garbled", fin == "not json" and not perr)
+_noage = {"role": "assistant", "content": "x", "stopReason": "error"}
+check("missing usage data is never classified as a notice", not omp._is_provider_notice(_noage))
+
 # 5. the provider fallback chain: a paid second route to the same judgment (2026-08-18).
 print("provider fallback chain:")
 import config
@@ -133,6 +160,10 @@ check("every metered route is spend-guarded",
 check("a second family backs up the judge",
       any('openai' not in m and 'gpt' not in m for m in chain[1:]),
       chain[-1])
+check("no retired model in the judge chain", 'google-antigravity/gemini-3-pro' not in chain,
+      "retired 2026-10-02")
+check("xAI is reachable in the judge chain when paid fallback is on",
+      any(m.startswith('xai/') for m in chain))
 check("no reroute lands on the builder's family",
       not any('claude' in m or 'anthropic' in m for m in chain),
       "reviewer never shares the builder's family (I3)")

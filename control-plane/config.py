@@ -89,8 +89,9 @@ ROLES: dict[str, Role] = {
 # Ids are overridable per role by env var, because an aggregator's catalog moves faster than this
 # file does.
 # The Gemini ladder on the Antigravity subscription, strongest first. See the note below.
+# gemini-3-pro REMOVED 2026-10-02: retired by Google ("no longer available, switch to 3.1 Pro").
+# omp._is_provider_notice now makes any retired model fall through, but a dead rung is still noise.
 _AG = ("google-antigravity/gemini-3.1-pro",
-       "google-antigravity/gemini-3-pro",
        "google-antigravity/gemini-2.5-pro",
        "google-antigravity/gemini-3.7-flash-tiered")
 

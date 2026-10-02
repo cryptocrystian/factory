@@ -124,7 +124,37 @@ def _parse_stream(lines: list[str]):
                     )
                     if txt.strip():
                         final_text = txt.strip()
+                        if _is_provider_notice(m):
+                            # The text is the PROVIDER talking, not the model: no answer exists.
+                            provider_error = (f"{m.get('errorMessage') or 'provider notice'}"
+                                              f" — provider said: {final_text[:200]}")
+                            final_text = ""
     return session_id, final_text, max_cost, n, provider_error, retry_after_s
+
+
+def _is_provider_notice(msg: dict) -> bool:
+    """A final assistant turn that ended in ERROR having produced ZERO output tokens is a provider
+    notice wearing the model's clothes, not an answer.
+
+    2026-10-02: Antigravity retired gemini-3-pro and answered every call with the text "Gemini 3 Pro
+    is no longer available…" — stopReason "error", output tokens 0. Because text was present, the
+    run read it as a model that answered and garbled its envelope (behaviour, re-promptable), so the
+    reviewer's fallback chain stopped there instead of walking on to xAI, and probe() reported the
+    judge HEALTHY. The daemon then spent 27 full plan+build cycles in 17 hours on work no reviewer
+    could judge.
+
+    Both conditions are required. A turn that errored AFTER producing real output (a truncated
+    answer) is still model output; a turn that ended normally is an answer however garbled (the
+    2026-08-19 grok case). Missing usage data → not a notice, so the old behaviour holds."""
+    if msg.get("stopReason") != "error":
+        return False
+    usage = msg.get("usage")
+    if not isinstance(usage, dict) or "output" not in usage:
+        return False
+    try:
+        return float(usage.get("output") or 0) == 0
+    except (TypeError, ValueError):
+        return False
 
 
 # Where a host advertises the auth-broker to borrow OAuth from. A broker-env file holds
